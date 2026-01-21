@@ -1,0 +1,16 @@
+transfer_barcode
+report/create_summary
+stitcher/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# R
+.Rhistory
+.RData
+.Rproj.user
