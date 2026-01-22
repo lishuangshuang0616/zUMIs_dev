@@ -39,7 +39,10 @@ def get_bam_read_length(bam_file, samtools, n_reads=1000):
         proc.terminate()
         proc.wait()
 
-    if proc.returncode not in (0, -15):
+    # rc=0: success
+    # rc=-15: SIGTERM (we terminated it)
+    # rc=-13: SIGPIPE (we closed the pipe while it was writing, expected)
+    if proc.returncode not in (0, -15, -13):
         stderr = proc.stderr.read().strip() if proc.stderr else ''
         raise RuntimeError(f"samtools view failed (rc={proc.returncode}) for {bam_file}: {stderr}")
 
@@ -128,8 +131,9 @@ def main():
         filtered_bams = [os.path.join(out_dir, f"{project}.filtered.tagged.unmapped.bam")]
 
     if not filtered_bams:
-        print("No BAM files found for mapping.")
-        sys.exit(1)
+        msg = f"No BAM files found for mapping in {tmp_merge_dir} matching pattern {project}.*.filtered.tagged.bam"
+        print(msg)
+        raise FileNotFoundError(msg)
 
     # 2. Setup GTF
     final_gtf, param_add_fa = setup_gtf(config, project, out_dir, samtools)
@@ -138,6 +142,9 @@ def main():
     read_len = get_bam_read_length(filtered_bams[0], samtools)
     print(f"Detected Read Length: {read_len}")
     
+    if read_len <= 0:
+        raise ValueError(f"Detected read length is {read_len}. Please check if the input BAM file {filtered_bams[0]} is empty or corrupted.")
+    
     # 4. Calc STAR instances
     # R script logic: genome size from du -sh. 
     # Let's approximate.
@@ -145,7 +152,13 @@ def main():
         
     num_instances = math.floor(mem_limit / genome_size)
     if num_instances < 1: num_instances = 1
+    if num_instances > 5: num_instances = 5 # Limit to max 5 chunks per user request
     if num_instances > num_threads: num_instances = num_threads
+
+    print(f"DEBUG: Genome Size: {genome_size:.2f} GB")
+    print(f"DEBUG: Memory Limit: {mem_limit} GB")
+    print(f"DEBUG: Calculated STAR instances: {num_instances} (Max allowed: 5)")
+    print(f"DEBUG: Threads per instance: {num_threads} (total) -> {max(1, math.floor((num_threads - (2 if num_threads > 8 else 1)) / num_instances))} (per STAR)")
     
     samtools_cores = 2 if num_threads > 8 else 1
     avail_cores = num_threads - samtools_cores
@@ -156,7 +169,7 @@ def main():
     read_layout = config.get('read_layout', 'SE')
     
     # Note: R script used --readFilesType SAM <read_layout> 
-    # Usually valid values are 'SAM SE' or 'SAM PE'
+    # Usually valid values are 'SAM SE' or 'SAM PE' 
     
     defaults = f"--readFilesCommand {samtools} view -@{samtools_cores} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --quantMode TranscriptomeSAM --limitOutSJcollapsed 5000000"
     misc = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {avail_cores} --sjdbOverhang {read_len-1} --readFilesType SAM {read_layout}"

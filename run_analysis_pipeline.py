@@ -56,57 +56,119 @@ def make_dir(data):
 
 
 def validate_type_id(data):
-    if data['sample']['sample_type'].lower() != 'manual' and data['sample']['sample_type'].lower() != 'auto':
-        raise ValueError('Wrong sample type in yaml file, must be "manual" or "auto".')
+    sample_type = data['sample']['sample_type'].lower()
     
-    if data['sample']['sample_type'] == '' or data['sample']['sample_id'] == '':      
-        raise ValueError('sample type and sample id must set in yaml file')
+    if sample_type not in ['manual', 'auto', 'custom', 'external']:
+        raise ValueError('Wrong sample type in yaml file, must be "manual", "auto" or "custom".')
+    
+    if sample_type == 'custom' or sample_type == 'external':
+        if 'barcode_file' not in data['barcodes'] or not data['barcodes']['barcode_file']:
+             raise ValueError('For "custom" sample type, "barcode_file" must be specified in "barcodes" section.')
+        if not os.path.exists(data['barcodes']['barcode_file']):
+             raise FileNotFoundError(f"Custom barcode file not found: {data['barcodes']['barcode_file']}")
+        return # No ID validation needed for custom
 
-    if data['sample']['sample_type'].lower() == 'manual':
-        s_id=str(data['sample']['sample_id']).split(',')
+    if data['sample']['sample_id'] == '':      
+        raise ValueError('sample_id must be set in yaml file for manual/auto modes')
+
+    if sample_type == 'manual':
+        s_id = str(data['sample']['sample_id']).split(',')
         for ind in s_id:
-            if int(ind) < 1 or int(ind) > 24:
+            ind = ind.strip() # Remove whitespace
+            if not ind.isdigit() or int(ind) < 1 or int(ind) > 24:
                 raise ValueError('Manual version sample id must be set within the range of 1-24, with multiple ids separated by commas.')                
     else:
-        try: 
-            ind=int(data['sample']['sample_id'])
-            if ind < 1 or ind > 12:
-                raise ValueError('Automatic version sample ID must be set within the range 1-12.')
-        except:
-            raise TypeError(f'Automatic version sample ID only support single sample id.')
+        # Auto mode
+        s_id = str(data['sample']['sample_id']).split(',')
+        for ind in s_id:
+            ind = ind.strip()
+            try: 
+                i_val = int(ind)
+                if i_val < 1 or i_val > 12:
+                    raise ValueError('Automatic version sample ID must be set within the range 1-12.')
+            except ValueError:
+                raise TypeError(f'Automatic version sample ID must be integers (1-12), got "{ind}".')
 
 
 def create_barcode(data):
-    sample_type=data['sample']['sample_type'].lower()
-    sample_id=str(data['sample']['sample_id'])
-    out_path=data['out_dir']
-    script_path=data['zUMIs_directory']
+    sample_type = data['sample']['sample_type'].lower()
+    out_path = data['out_dir']
+    script_path = data['zUMIs_directory']
+    
+    # Custom/External Mode
+    if sample_type == 'custom' or sample_type == 'external':
+        provided_bc = data['barcodes']['barcode_file']
+        print(f"Using custom barcode file: {provided_bc}")
+        dest_summary = f'{out_path}/config/expect_id_barcode.tsv'
+        dest_pipe = f'{out_path}/config/expect_barcode.tsv'
+        
+        shutil.copy(provided_bc, dest_summary)
+        
+        # Extract just barcodes for pipe file
+        with open(provided_bc, 'r') as infile, open(dest_pipe, 'w') as outfile:
+            for line in infile:
+                parts = line.strip().split('\t')
+                if len(parts) >= 3:
+                     if parts[0].lower() == 'wellid': continue
+                     outfile.write('\t'.join(parts[1:]) + '\n')
+        return
 
-    if sample_type=='manual':
-        with open(f'{script_path}/manual_barcode_list.yaml', 'r', encoding='utf-8') as y:
-            barcode_set = yaml.safe_load(y)
-        sample_id=sample_id.split(',')
-        with open(f'{out_path}/config/expect_barcode.tsv','w') as pipe_file, open(f'{out_path}/config/expect_bin_barcode.tsv','w') as bin_file, open(f'{out_path}/config/expect_id_barcode.tsv','w') as summary_file:
-            print('\t'.join(['wellID','umi_barcodes','internal_barcodes']),file=summary_file)
-            for c in sample_id:
-                bc_t_i5=barcode_set[c][0];bc_n_i5=barcode_set[c][1];bc_n_i7=barcode_set[c][2]
-                for k,v in zip(bc_t_i5,bc_n_i5):
+    sample_id_str = str(data['sample']['sample_id'])
+    sample_ids = [s.strip() for s in sample_id_str.split(',')]
+
+    with open(f'{out_path}/config/expect_barcode.tsv','w') as pipe_file, \
+         open(f'{out_path}/config/expect_id_barcode.tsv','w') as summary_file:
+        
+        print('\t'.join(['wellID','umi_barcodes','internal_barcodes']), file=summary_file)
+
+        if sample_type == 'manual':
+            with open(f'{script_path}/yaml/manual_barcode_list.yaml', 'r', encoding='utf-8') as y:
+                barcode_set = yaml.safe_load(y)
+            
+            for c in sample_ids:
+                if c not in barcode_set: continue
+                bc_t_i5 = barcode_set[c][0]
+                bc_n_i5 = barcode_set[c][1]
+                bc_n_i7 = barcode_set[c][2]
+                
+                # Generate all combinations
+                umi_bcs = []
+                int_bcs = []
+                for k, v in zip(bc_t_i5, bc_n_i5):
                     for j in bc_n_i7:
-                        print('\t'.join([k+j,v+j]),file=pipe_file)
-                for kk,vv in zip(bc_t_i5,bc_n_i5):
-                    for jj in bc_n_i7:
-                        print('\t'.join([kk+jj,vv+jj]),file=bin_file)
-                        print('\t'.join(['A'+c,kk+jj,vv+jj]),file=summary_file)
-                        break
-                    break
-    else:
-        with open(f'{script_path}/auto_barcode_list.yaml', 'r', encoding='utf-8') as y:
-            barcode_set = yaml.safe_load(y)
-        with open(f'{out_path}/config/expect_barcode.tsv','w') as pipe_file, open(f'{out_path}/config/expect_id_barcode.tsv','w') as summary_file:
-            print('\t'.join(['wellID','umi_barcodes','internal_barcodes']),file=summary_file)
-            for k in barcode_set[f'plate{sample_id}']:
-                print('\t'.join(barcode_set[f'plate{sample_id}'][k]),file=pipe_file)
-                print(k+'\t'+'\t'.join(barcode_set[f'plate{sample_id}'][k]),file=summary_file)    
+                        umi_bcs.append(k + j)
+                        int_bcs.append(v + j)
+                
+                well_id = f"MANUAL{c}"
+                umi_str = ",".join(umi_bcs)
+                int_str = ",".join(int_bcs)
+                
+                # Write one line per manual sample
+                print(f"{well_id}\t{umi_str}\t{int_str}", file=summary_file)
+                print(f"{umi_str}\t{int_str}", file=pipe_file)
+        else:
+            # Auto Mode (Multi-plate support)
+            with open(f'{script_path}/yaml/auto_barcode_list.yaml', 'r', encoding='utf-8') as y:
+                barcode_set = yaml.safe_load(y)
+            
+            for sid in sample_ids:
+                plate_key = f'plate{sid}'
+                if plate_key not in barcode_set:
+                    raise ValueError(f"Plate ID {sid} not found in auto_barcode_list.yaml")
+                
+                for well in barcode_set[plate_key]:
+                    well_id = f"P{sid}{well}"
+                    # Assuming auto_barcode_list values are already lists or strings
+                    val = barcode_set[plate_key][well]
+                    # Format depends on structure: [umi_seq, int_seq] or [[umi1, umi2], [int1, int2]]
+                    umi_part = val[0]
+                    int_part = val[1]
+                    
+                    umi_str = ",".join(umi_part) if isinstance(umi_part, list) else str(umi_part)
+                    int_str = ",".join(int_part) if isinstance(int_part, list) else str(int_part)
+                    
+                    print(f"{well_id}\t{umi_str}\t{int_str}", file=summary_file)
+                    print(f"{umi_str}\t{int_str}", file=pipe_file)    
     
     
 def check_file_exists(data):
@@ -121,7 +183,6 @@ def check_file_exists(data):
 
 def process_fq(data):
     sample_type = data['sample']['sample_type'].lower()
-    script_path = data['zUMIs_directory']
     fq1 = data['sequence_files']['file1']['name']
     fq1_name = os.path.basename(fq1)
     fq2 = data['sequence_files']['file2']['name']
@@ -139,43 +200,22 @@ def process_fq(data):
         os.symlink(src, dst)
 
     ensure_symlink(fq1, f'{out_path}/data/{fq1_name}')
-
-    if sample_type == 'manual':
-        out_fq2_name = f'{fq2_name}.process.fq.gz'
-        ham_dist=data['barcodes']['BarcodeBinning']
-        threads=data['num_threads']
-        print('Process fastq binning......', flush=True)
-        cmd = [
-            os.path.join(script_path, 'transfer_barcode'),
-            '-i', fq2,
-            '-l', f'{out_path}/config/expect_barcode.tsv',
-            '-o', out_fq2_name,
-            '-d', str(ham_dist),
-            '-p', f'{out_path}/data',
-            '-t', str(threads),
-            '-e', script_path,
-        ]
-        process_status = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if process_status.returncode != 0:
-            raise RuntimeError(f'Bin barcode error: {process_status.stderr}')
-    else:
-        ensure_symlink(fq2, f'{out_path}/data/{fq2_name}')
-        out_fq2_name = fq2_name
+    ensure_symlink(fq2, f'{out_path}/data/{fq2_name}')
+    
+    # Unified logic: always symlink, no preprocessing with transfer_barcode
+    out_fq2_name = fq2_name
 
     return fq1_name, out_fq2_name
 
 
 def modify_yaml(data, fq1_names, fq2_names):
-    sample_type = data['sample']['sample_type'].lower()
     out_path=data['out_dir']
     
     data['sequence_files']['file1']['name'] = f'{out_path}/data/{fq1_names}'
     data['sequence_files']['file2']['name'] = f'{out_path}/data/{fq2_names}'
 
-    if sample_type == 'manual':
-        data['barcodes']['barcode_file'] = f'{out_path}/config/expect_bin_barcode.tsv'
-    else:
-        data['barcodes']['barcode_file'] = f'{out_path}/config/expect_barcode.tsv'
+    # Unified barcode file
+    data['barcodes']['barcode_file'] = f'{out_path}/config/expect_barcode.tsv'
     
     new_data=copy.deepcopy(data)
     del new_data['sample']
@@ -208,7 +248,14 @@ def modify_yaml(data, fq1_names, fq2_names):
     yaml.add_representer(bool, bool_representer, Dumper=ZumisDumper)
     yaml.add_representer(type(None), none_representer, Dumper=ZumisDumper)
 
-    new_data['counting_opts']['downsampling'] = ForceStr(new_data['counting_opts']['downsampling'])
+    # Ensure downsampling is a string, even if parsed as list or number
+    ds_val = new_data['counting_opts'].get('downsampling', '0')
+    if isinstance(ds_val, list):
+        ds_val = ",".join(map(str, ds_val))
+    else:
+        ds_val = str(ds_val)
+    
+    new_data['counting_opts']['downsampling'] = ForceStr(ds_val)
 
     config_path = f'{out_path}/config/final_config.yaml'
     with open(config_path, 'w') as out_yaml:
@@ -290,9 +337,29 @@ def run_pipeline_stages(yaml_file):
 
             chunk_suffixes = []
 
+            def run_stage_cmd(cmd, stage_name, shell=False):
+                if isinstance(cmd, list) and not shell:
+                    cmd_str = " ".join(cmd)
+                else:
+                    cmd_str = str(cmd)
+                
+                # print(f">>> Running {stage_name}: {cmd_str}") # Already printed by stage headers mostly
+                
+                res = subprocess.run(cmd, stdout=run_log, stderr=subprocess.STDOUT, shell=shell)
+                if res.returncode != 0:
+                    run_log.flush()
+                    try:
+                        with open(log_path, 'r') as lr:
+                            print(f"\n[ERROR] {stage_name} failed (rc={res.returncode}). Last 30 lines of log ({log_path}):\n", file=sys.stderr)
+                            print("".join(lr.readlines()[-30:]), file=sys.stderr)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"{stage_name} failed with exit code {res.returncode}.")
+
             if which_stage == "Filtering":
                 print(">>> Starting Filtering Stage")
-
+                # ... (Filtering code remains mostly same, but fqfilter is manual Popen) ...
+                
                 file_paths = []
                 for entry in sorted_sequence_file_entries(config.get('sequence_files', {})):
                     if isinstance(entry, dict) and entry.get('name'):
@@ -332,9 +399,28 @@ def run_pipeline_stages(yaml_file):
                 chunk_suffixes = results[0].get()
 
                 print(">>> Running fqfilter.py on chunks")
+                
+                # Check for max_reads limit in config
+                max_reads = config.get('counting_opts', {}).get('max_reads', 0)
+                if not max_reads:
+                    max_reads = config.get('max_reads', 0) # Support top-level as well
+                
                 processes = []
                 for suffix in chunk_suffixes:
                     cmd = ['python3', f'{zumis_dir}/fqfilter.py', yaml_file, samtools, rscript, pigz, zumis_dir, suffix]
+                    
+                    if max_reads and int(max_reads) > 0:
+                        # If we have multiple chunks, we should probably divide the limit?
+                        # Or just apply the limit to each chunk?
+                        # If we split the file, each chunk has a fraction of reads.
+                        # If we apply total limit to EACH chunk, we get N * limit total.
+                        # But since we use round-robin, reads are distributed evenly.
+                        # So if we want TOTAL 100k reads, and we have 10 chunks, we should limit each to 10k.
+                        
+                        chunk_limit = int(int(max_reads) / len(chunk_suffixes))
+                        if chunk_limit < 1: chunk_limit = 1
+                        cmd.extend(['--limit', str(chunk_limit)])
+                        
                     processes.append(subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
 
                 for p in processes:
@@ -346,13 +432,15 @@ def run_pipeline_stages(yaml_file):
                 pipeline_modules.merge_bam_stats(tmp_merge_dir, project, out_dir, yaml_file, samtools)
 
                 print(">>> Running Barcode Detection")
-                pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-BCdetection.R", yaml_file], "BCdetection", log_path)
+                # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-BCdetection.R", yaml_file], "BCdetection", log_path)
+                # Updated to use the faster Python implementation for BC detection
+                run_stage_cmd(["python3", f"{zumis_dir}/zUMIs_BCdetection.py", yaml_file], "BCdetection")
 
                 bc_bin_table = os.path.join(out_dir, 'zUMIs_output', f"{project}.BCbinning.txt")
-                bc_bin_raw_table = os.path.join(out_dir, 'zUMIs_output', f"{project}.BCbinning.raw.txt")
+                expect_id_barcode_file = os.path.join(out_dir, '../config', 'expect_id_barcode.tsv')
+                
                 if os.path.exists(bc_bin_table):
                     print(">>> Correcting BC Tags")
-                    chemistry = config.get('chemistry', '')
                     correct_processes = []
 
                     for suffix in chunk_suffixes:
@@ -362,9 +450,11 @@ def run_pipeline_stages(yaml_file):
                         if os.path.exists(fixed_bam):
                             os.rename(fixed_bam, raw_bam)
 
-                        cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam, bc_bin_table, samtools]
-                        if chemistry == 'MGI':
-                            cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam, bc_bin_table, samtools, bc_bin_raw_table]
+                        # New argument list: raw_bam, fixed_bam, bc_bin_table, samtools, expect_id_barcode
+                        # We removed the MGI specific bc_bin_raw_table passing to simplify logic.
+                        # Now all chemistries follow the same path: zUMIs correction -> WellID mapping -> Internal UMI clearing.
+                        
+                        cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam, bc_bin_table, expect_id_barcode_file]
 
                         correct_processes.append(subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
 
@@ -376,23 +466,26 @@ def run_pipeline_stages(yaml_file):
             if which_stage in ["Filtering", "Mapping"]:
                 print(">>> Starting Mapping Stage")
                 map_cmd = ['python3', f'{zumis_dir}/mapping_analysis.py', yaml_file]
-                subprocess.run(map_cmd, stdout=run_log, stderr=subprocess.STDOUT, check=True)
+                run_stage_cmd(map_cmd, "mapping_analysis.py")
 
             if which_stage in ["Filtering", "Mapping", "Counting"]:
                 print(">>> Starting Counting Stage")
-                pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-dge2.R", yaml_file], "FeatureCounts (R)", log_path)
+                # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-dge2.R", yaml_file], "FeatureCounts (R)", log_path)
+                run_stage_cmd([rscript, f"{zumis_dir}/zUMIs-dge2.R", yaml_file], "FeatureCounts (R)")
 
                 print(">>> Starting DGE Analysis (Python)")
                 dge_cmd = ['python3', f'{zumis_dir}/dge_analysis.py', yaml_file, samtools]
-                subprocess.run(dge_cmd, stdout=run_log, stderr=subprocess.STDOUT, check=True)
+                run_stage_cmd(dge_cmd, "dge_analysis.py")
 
                 if config.get('velocyto', 'no') == 'yes':
-                    pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/runVelocyto.R", yaml_file], "Velocyto", log_path)
+                    # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/runVelocyto.R", yaml_file], "Velocyto", log_path)
+                    run_stage_cmd([rscript, f"{zumis_dir}/runVelocyto.R", yaml_file], "Velocyto")
 
             if which_stage in ["Filtering", "Mapping", "Counting", "Summarising"]:
                 if config.get('make_stats', 'no') == 'yes':
                     print(">>> Starting Statistics Stage")
-                    pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-stats2.R", yaml_file], "Stats", log_path)
+                    # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-stats2.R", yaml_file], "Stats", log_path)
+                    run_stage_cmd([rscript, f"{zumis_dir}/zUMIs-stats2.R", yaml_file], "Stats")
 
             print("Pipeline Finished Successfully.")
         finally:

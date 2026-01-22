@@ -118,12 +118,9 @@ setDownSamplingOption<-function( down ,bccount, filename=NULL){
 }
 .cellBarcode_known   <- function( bccount, bcfile ){
 
-  bc_data <-read.table(bcfile,header = F,stringsAsFactors = F,sep='\t')
-  if (ncol(bc_data) == 1) {
-    bc <- bc_data$V1
-  } else {
-    bc <- c(bc_data$V1, bc_data$V2)
-  }
+  bc_data <-read.table(bcfile,header = F,stringsAsFactors = F,sep='\t', fill = TRUE)
+  bc <- unlist(strsplit(as.character(unlist(bc_data)), split = "[,[:space:]]+"))
+  bc <- bc[bc != ""]
 
   if( any( bc %in% bccount$XC ) ){
     bccount[XC %in% bc,keep:=TRUE]
@@ -142,12 +139,9 @@ setDownSamplingOption<-function( down ,bccount, filename=NULL){
 }
 .cellBarcode_expect <- function( bccount, bcfile, outfilename=NULL) {
   #reading barcodes
-  bc_data <-read.table(bcfile,header = F,stringsAsFactors = F,sep='\t')
-  if (ncol(bc_data) == 1) {
-    bc_wl <- bc_data$V1
-  } else {
-    bc_wl <- c(bc_data$V1, bc_data$V2)
-  }
+  bc_data <-read.table(bcfile,header = F,stringsAsFactors = F,sep='\t', fill = TRUE)
+  bc_wl <- unlist(strsplit(as.character(unlist(bc_data)), split = "[,[:space:]]+"))
+  bc_wl <- bc_wl[bc_wl != ""]
 
   bccount[ ,cs:=cumsum(as.numeric(n))]
   cut <- .FindBCcut(bccount)
@@ -318,44 +312,6 @@ BCbin <- function(bccount_file, bc_detected) {
 
     share_mode <- data.table::fread( opt$barcodes$barcode_sharing, header = F, nrows = 1)$V1
     share_mode <- as.numeric(unlist(strsplit(gsub(pattern = "#",replacement = "", x = share_mode),"-")))
-
-    if(nrow(binmap_raw)>0){ #first fix the noisy BC assignments so that they dont go into share barcodes
-      binmap_raw[, partial_bc := substr(trueBC,start = share_mode[1], stop = share_mode[2])]
-      binmap <- merge(binmap_raw, share_table, all.x = TRUE, by.x = "partial_bc", by.y = "shared_bc")
-      substr(binmap[!is.na(main_bc)]$trueBC,start = share_mode[1], stop = share_mode[2]) <- binmap[!is.na(main_bc)]$main_bc #replace to main barcode string
-      binmap[,c("partial_bc", "main_bc") := NULL]
-    }
-
-    #now check for merging detected barcodes
-    bc_detected[, partial_bc := substr(XC,start = share_mode[1], stop = share_mode[2])]
-    bc_detected <- merge(bc_detected, share_table, all.x = TRUE, by.x = "partial_bc", by.y = "shared_bc")
-    share_map <- bc_detected[!is.na(main_bc)]
-    share_map[,trueBC := XC]
-    substr(share_map$trueBC, start = share_mode[1], stop = share_mode[2]) <- share_map$main_bc
-    setnames(share_map,"XC","falseBC")
-    share_map[,c("partial_bc","main_bc","cellindex") := NULL][,hamming := 0]
-    share_map <- share_map[,c("falseBC","hamming","trueBC","n"), with = FALSE]
-
-    #messy move the shorter true bc list to the main R script
-    bc_detected <- bc_detected[is.na(main_bc)]
-    bc_detected[,c("partial_bc","main_bc") := NULL]
-    bccount <<- bc_detected
-
-    if(nrow(binmap)>0){
-      binmap <- rbind(binmap, share_map)
-    }else{
-      binmap <- share_map
-    }
-  }
-
-  if(opt$chemistry== "MGI"){
-    share_table <- data.table::fread( opt$barcodes$barcode_file, header = F, fill = TRUE)
-    if(ncol(share_table) > 2){ #flatten table more if necessary
-      share_table <- data.table::melt(share_table, id.vars = "V1")[, !"variable", with = FALSE]
-    }
-    setnames(share_table, c("main_bc","shared_bc"))
-    share_table <- share_table[shared_bc != '']
-    share_mode <- c(1,20)
 
     if(nrow(binmap_raw)>0){ #first fix the noisy BC assignments so that they dont go into share barcodes
       binmap_raw[, partial_bc := substr(trueBC,start = share_mode[1], stop = share_mode[2])]

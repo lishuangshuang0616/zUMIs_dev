@@ -73,15 +73,35 @@ def fastq_iter(handle):
         seq = handle.readline().rstrip(b'\n\r')
         _plus = handle.readline()
         qual = handle.readline().rstrip(b'\n\r')
+        
+        if len(seq) != len(qual):
+            sys.stderr.write(f"Warning: SEQ/QUAL length mismatch in {header.decode().strip()}: {len(seq)} vs {len(qual)}\n")
+            # Pad or truncate qual to match seq length to prevent crashes/offsets
+            if len(qual) < len(seq):
+                qual += b'#' * (len(seq) - len(qual))
+            else:
+                qual = qual[:len(seq)]
+                
         yield header.rstrip(b'\n\r'), seq, qual
 
 def main():
     if len(sys.argv) < 7:
-        print("Usage: python3 fqfilter.py <yaml> <samtools> <rscript> <pigz> <zumis_dir> <tmp_prefix>")
+        print("Usage: python3 fqfilter.py <yaml> <samtools> <rscript> <pigz> <zumis_dir> <tmp_prefix> [--limit N]")
         sys.exit(1)
 
-    yaml_file, samtools, _rscript, pigz, _zumis_dir, tmp_prefix = sys.argv[1:7]
+    yaml_file = sys.argv[1]
+    samtools = sys.argv[2]
+    pigz = sys.argv[4]
+    tmp_prefix = sys.argv[6]
     
+    # Parse optional --limit
+    read_limit = 0
+    if len(sys.argv) > 7 and sys.argv[7] == '--limit':
+        try:
+            read_limit = int(sys.argv[8])
+        except (IndexError, ValueError):
+            pass
+            
     config = get_config(yaml_file)
     project = config['project']
     out_dir = config['out_dir']
@@ -144,7 +164,7 @@ def main():
             base_name = base_name[:-3]
         chunk_path = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{base_name}{tmp_prefix}.gz")
 
-        p = subprocess.Popen([pigz, '-dc', chunk_path], stdout=subprocess.PIPE, text=False, bufsize=1024*1024)
+        p = subprocess.Popen([pigz, '-p', '2', '-dc', chunk_path], stdout=subprocess.PIPE, text=False, bufsize=1024*1024)
         pigz_procs.append(p)
         handles.append(p.stdout)
 
@@ -165,6 +185,9 @@ def main():
     
     try:
         for records in zip(*iters):
+            if read_limit > 0 and total >= read_limit:
+                break
+                
             total += 1
             
             # Record 0 is usually the one with BC/UMI in this pipeline's convention
@@ -239,17 +262,28 @@ def main():
                 b"\tQU:Z:" + final_umi_q +
                 b"\n"
             )
+            
+            # Ensure valid SAM fields for SEQ and QUAL
+            seq1_out = final_cdna1 if final_cdna1 else b"*"
+            qual1_out = final_cdna1_q if final_cdna1_q else b"*"
+            
+            if seq1_out != b"*" and qual1_out == b"*":
+                sys.stderr.write(f"DEBUG: R1 SEQ present but QUAL missing! ID: {rid}\n")
+            
+            seq2_out = final_cdna2 if final_cdna2 else b"*"
+            qual2_out = final_cdna2_q if final_cdna2_q else b"*"
+
             if layout == "SE":
                 line = b"\t".join([
-                    rid, b"4", b"*", b"0", b"0", b"*", b"*", b"0", b"0", final_cdna1, final_cdna1_q
+                    rid, b"4", b"*", b"0", b"0", b"*", b"*", b"0", b"0", seq1_out, qual1_out
                 ]) + tags
                 bam_out.write(line)
             else:
                 line1 = b"\t".join([
-                    rid, b"77", b"*", b"0", b"0", b"*", b"*", b"0", b"0", final_cdna1, final_cdna1_q
+                    rid, b"77", b"*", b"0", b"0", b"*", b"*", b"0", b"0", seq1_out, qual1_out
                 ]) + tags
                 line2 = b"\t".join([
-                    rid, b"141", b"*", b"0", b"0", b"*", b"*", b"0", b"0", final_cdna2, final_cdna2_q
+                    rid, b"141", b"*", b"0", b"0", b"*", b"*", b"0", b"0", seq2_out, qual2_out
                 ]) + tags
                 bam_out.write(line1)
                 bam_out.write(line2)
@@ -271,6 +305,8 @@ def main():
             except Exception:
                 pass
 
+        # We close the pipes above, so pigz might get SIGPIPE.
+        # This is expected behavior when we limit reads.
         for p in pigz_procs:
             p.wait()
 
@@ -278,7 +314,8 @@ def main():
             raise RuntimeError(f"samtools failed (rc={samtools_proc.returncode}) writing {out_bam}")
 
         for p in pigz_procs:
-            if p.returncode != 0:
+            # Allow SIGPIPE (141 or -13)
+            if p.returncode not in (0, -13, 141):
                 raise RuntimeError(f"pigz failed (rc={p.returncode}) while reading chunk(s) for prefix {tmp_prefix}")
 
     # Write BC stats

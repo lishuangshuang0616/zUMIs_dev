@@ -22,119 +22,89 @@ def run_shell_cmd(cmd, step_name, log_file=None):
 
 def split_fastq(fq_file, n_threads, n_reads, out_dir, project, pigz_exec="pigz"):
     """
-    Splits a FastQ file into chunks based on number of threads.
-    Replaces splitfq.sh logic but without depending on GNU split --filter.
+    Splits a FastQ file into exactly n_threads chunks using Batch Round Robin.
+    This ensures perfectly balanced chunks without needing accurate read count estimation.
     """
     base_name = os.path.basename(fq_file)
     if base_name.endswith('.gz'):
         base_name = base_name[:-3]
     
-    # Calculate lines per chunk
-    # n_reads is total reads. n_chunks = n_threads.
-    # Each read is 4 lines.
-    reads_per_chunk = math.ceil(n_reads / n_threads)
-    lines_per_chunk = reads_per_chunk * 4
-    
-    print(f"Splitting {fq_file} into {n_threads} chunks (~{reads_per_chunk} reads each)...")
+    batch_size = 200000 # lines per batch (50,000 reads)
+    print(f"Splitting {fq_file} into {n_threads} balanced chunks (batch size: {batch_size} lines)...")
     
     # Open input stream
     if fq_file.endswith('.gz'):
-        # Use pigz for fast decompression
         p_in = subprocess.Popen([pigz_exec, '-dc', fq_file], stdout=subprocess.PIPE, bufsize=1024*1024)
         input_stream = p_in.stdout
     else:
         input_stream = open(fq_file, 'rb')
 
-    chunk_idx = 0
-    line_count = 0
-    current_p_out = None
-    current_out_fh = None
-    buffer = bytearray()
-    flush_bytes = 1024 * 1024
+    # Initialize all output processes and file handles
+    out_procs = []
+    out_fhs = []
     prefixes = []
-
+    buffers = [bytearray() for _ in range(n_threads)]
+    flush_threshold = 1024 * 1024 # 1MB internal buffer before pipe write
+    
     try:
-        # Create first chunk
-        prefix_suffix = f"{base_name}{project}{chr(ord('a') + chunk_idx // 26)}{chr(ord('a') + chunk_idx % 26)}"
-        out_path = os.path.join(out_dir, f"{prefix_suffix}.gz")
-        prefixes.append(prefix_suffix)
-        
-        # Use pigz for fast compression
-        current_out_fh = open(out_path, 'wb')
-        current_p_out = subprocess.Popen([pigz_exec, '-c'], stdin=subprocess.PIPE, stdout=current_out_fh)
+        for i in range(n_threads):
+            suffix = f"{chr(ord('a') + i // 26)}{chr(ord('a') + i % 26)}"
+            prefix_suffix = f"{project}{suffix}"
+            full_prefix = f"{base_name}{prefix_suffix}"
+            out_path = os.path.join(out_dir, f"{full_prefix}.gz")
+            
+            prefixes.append(prefix_suffix)
+            fh = open(out_path, 'wb')
+            # Use pigz for fast parallel compression
+            p = subprocess.Popen([pigz_exec, '-c'], stdin=subprocess.PIPE, stdout=fh, bufsize=1024*1024)
+            
+            out_fhs.append(fh)
+            out_procs.append(p)
+
+        current_chunk = 0
+        line_count = 0
         
         for line in input_stream:
-            buffer.extend(line)
+            buffers[current_chunk].extend(line)
             line_count += 1
-            if len(buffer) >= flush_bytes:
-                current_p_out.stdin.write(buffer)
-                buffer.clear()
             
-            if line_count >= lines_per_chunk and (line_count % 4 == 0):
-                if buffer:
-                    current_p_out.stdin.write(buffer)
-                    buffer.clear()
-                # Close current chunk
-                current_p_out.stdin.close()
-                current_p_out.wait()
-                current_out_fh.close()
-                if current_p_out.returncode != 0:
-                    raise RuntimeError(f"{pigz_exec} failed (rc={current_p_out.returncode}) while writing {out_path}")
+            # Flush buffer to pipe if threshold reached
+            if len(buffers[current_chunk]) >= flush_threshold:
+                out_procs[current_chunk].stdin.write(buffers[current_chunk])
+                buffers[current_chunk].clear()
+            
+            # Switch chunk after reaching batch size (must be multiple of 4 lines)
+            if line_count >= batch_size:
+                # Flush remaining buffer for current chunk before switching
+                if buffers[current_chunk]:
+                    out_procs[current_chunk].stdin.write(buffers[current_chunk])
+                    buffers[current_chunk].clear()
                 
-                # Start next chunk if not end of stream (handled by next loop iteration usually, but we check logic)
-                chunk_idx += 1
-                if chunk_idx >= n_threads: 
-                     # If we exceeded expected chunks (due to integer math), just keep writing to the last one?
-                     # Or create a new one. The original script creates up to n_threads.
-                     # But split command creates as many as needed. Let's just create new one.
-                     pass
-                
+                current_chunk = (current_chunk + 1) % n_threads
                 line_count = 0
-                prefix_suffix = f"{base_name}{project}{chr(ord('a') + chunk_idx // 26)}{chr(ord('a') + chunk_idx % 26)}"
-                out_path = os.path.join(out_dir, f"{prefix_suffix}.gz")
-                prefixes.append(prefix_suffix)
-                
-                current_out_fh = open(out_path, 'wb')
-                current_p_out = subprocess.Popen([pigz_exec, '-c'], stdin=subprocess.PIPE, stdout=current_out_fh)
 
     finally:
-        if current_p_out and current_p_out.stdin:
-            try:
-                if buffer:
-                    current_p_out.stdin.write(buffer)
-                    buffer.clear()
-                current_p_out.stdin.close()
-            except Exception:
-                pass
-            current_p_out.wait()
-            if current_p_out.returncode != 0:
-                raise RuntimeError(f"{pigz_exec} failed (rc={current_p_out.returncode}) while writing {out_path}")
-        if current_out_fh:
-            try:
-                current_out_fh.close()
-            except Exception:
-                pass
+        # Final flush and close all processes
+        for i in range(n_threads):
+            if buffers[i]:
+                try: out_procs[i].stdin.write(buffers[i])
+                except: pass
+            
+            if out_procs[i].stdin:
+                out_procs[i].stdin.close()
+            
+        for p in out_procs:
+            p.wait()
+            
+        for fh in out_fhs:
+            fh.close()
+            
         if fq_file.endswith('.gz'):
             p_in.wait()
-            if p_in.returncode != 0:
-                raise RuntimeError(f"{pigz_exec} failed (rc={p_in.returncode}) while reading {fq_file}")
         else:
             input_stream.close()
 
-    # Generate listPrefix file expected by fqfilter
-    # The suffix logic above needs to match what fqfilter expects or we pass the list explicitly.
-    # The original script generated suffixes like 'aa', 'ab'.
-    # My logic: base + project + suffix.
-    # Original: $t$pref$project + suffix.
-    # Returns the list of SUFFIXES (or full prefixes) for fqfilter to iterate.
-    
-    # Actually, fqfilter_v2.pl iterated over the output of `ls`.
-    # Our new fqfilter.py iterates over inputs passed to it?
-    # Wait, the new fqfilter.py (python version) I wrote calculates path: 
-    # chunk_path = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{base_name}{tmp_prefix}.gz")
-    # So I just need to return the list of 'suffix' strings (e.g., 'projectaa', 'projectab').
-    
-    return [f"{project}{chr(ord('a') + i // 26)}{chr(ord('a') + i % 26)}" for i in range(len(prefixes))]
+    return prefixes
 
 
 def merge_bam_stats(tmp_dir, project, out_dir, yaml_file, samtools_exec):
@@ -190,15 +160,6 @@ def merge_bam_stats(tmp_dir, project, out_dir, yaml_file, samtools_exec):
             parts = line.split('\t')
             if len(parts) > 1:
                 flag = int(parts[1])
-                # Flag 4 means unmapped. But assuming fqfilter outputs standard flags?
-                # fqfilter.py writes: SE -> 4 (unmapped? wait), PE -> 77/141.
-                # In fqfilter.py:
-                # SE: flag 4 (segment unmapped). Wait, if it's unmapped, STAR will map it later.
-                # PE: 77 (paired, unmapped, etc), 141 (paired, unmapped, second in pair).
-                
-                # Logic from mergeBAM.sh:
-                # if [[ $flag == 4 ]]; then SE else PE
-                
                 layout = "SE" if flag == 4 else "PE"
                 
                 # Update YAML

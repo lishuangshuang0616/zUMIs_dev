@@ -568,7 +568,19 @@ fixMissingOptions <- function(config){
     config$counting_opts$downsampling <- "0"
   }
 
-  if(config$counting_opts$downsampling == FALSE){
+  # Check if downsampling is logical FALSE (safe check handling NAs)
+  is_false_downsampling <- tryCatch(
+    is.logical(config$counting_opts$downsampling) && !is.na(config$counting_opts$downsampling) && config$counting_opts$downsampling == FALSE,
+    error = function(e) FALSE
+  )
+  
+  if(is_false_downsampling){
+    config$counting_opts$downsampling <- "0"
+  }
+  
+  # If it became NA (e.g. coercion warning), default to "0" to prevent crash, but warn
+  if(any(is.na(config$counting_opts$downsampling))){
+    print("Warning: downsampling option could not be parsed (NA), defaulting to 0.")
     config$counting_opts$downsampling <- "0"
   }
 
