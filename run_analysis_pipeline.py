@@ -233,7 +233,7 @@ def modify_yaml(data, fq1_names, fq2_names):
             self.value = value
 
     def force_str_representer(dumper, data):
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data.value, style='\'')
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data.value, style='"')
 
     class ZumisDumper(yaml.SafeDumper):
         pass
@@ -470,8 +470,10 @@ def run_pipeline_stages(yaml_file):
 
             if which_stage in ["Filtering", "Mapping", "Counting"]:
                 print(">>> Starting Counting Stage")
+                # Replaced R script with Python implementation
                 # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-dge2.R", yaml_file], "FeatureCounts (R)", log_path)
-                run_stage_cmd([rscript, f"{zumis_dir}/zUMIs-dge2.R", yaml_file], "FeatureCounts (R)")
+                featurecounts_cmd = ['python3', f'{zumis_dir}/run_featurecounts.py', yaml_file]
+                run_stage_cmd(featurecounts_cmd, "FeatureCounts (Python)")
 
                 print(">>> Starting DGE Analysis (Python)")
                 dge_cmd = ['python3', f'{zumis_dir}/dge_analysis.py', yaml_file, samtools]
@@ -482,10 +484,12 @@ def run_pipeline_stages(yaml_file):
                     run_stage_cmd([rscript, f"{zumis_dir}/runVelocyto.R", yaml_file], "Velocyto")
 
             if which_stage in ["Filtering", "Mapping", "Counting", "Summarising"]:
-                if config.get('make_stats', 'no') == 'yes':
+                # Force stats to run by default if not explicitly disabled
+                if config.get('make_stats', 'yes') == 'yes':
                     print(">>> Starting Statistics Stage")
                     # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-stats2.R", yaml_file], "Stats", log_path)
-                    run_stage_cmd([rscript, f"{zumis_dir}/zUMIs-stats2.R", yaml_file], "Stats")
+                    stats_cmd = ['python3', f'{zumis_dir}/generate_stats.py', yaml_file]
+                    run_stage_cmd(stats_cmd, "Stats (Python)")
 
             print("Pipeline Finished Successfully.")
         finally:
@@ -497,6 +501,15 @@ def run_create_reports(data):
     sample_species = data['sample']['sample_species'].upper()
     script_path = data['zUMIs_directory']
     result_dir = data['out_dir']
+
+    summary_script = f'{script_path}/report/create_summary'
+    if not os.path.exists(summary_script):
+        print(f"Warning: Summary script not found at {summary_script}. Skipping report generation.")
+        # Try to copy stats PDF if available even if report generation is skipped
+        pdf_source = f'{result_dir}/analysis/zUMIs_output/stats/{sample_name}.features.pdf'
+        if os.path.exists(pdf_source):
+             shutil.copy(pdf_source, f'{result_dir}/results/{sample_name}.features.pdf')
+        return
 
     if sample_species == 'HUMAN':
         sample_species = 'Human'
@@ -519,7 +532,12 @@ def run_create_reports(data):
     
     shutil.copytree(f'{result_dir}/analysis/summary/div', f'{result_dir}/results/html')
     shutil.copy(f'{result_dir}/analysis/summary/{sample_name}_stat.xls', f'{result_dir}/results/{sample_name}_stat.xls')
-    shutil.copy(f'{result_dir}/analysis/zUMIs_output/stats/{sample_name}.features.pdf', f'{result_dir}/results/{sample_name}.features.pdf')
+    
+    pdf_source = f'{result_dir}/analysis/zUMIs_output/stats/{sample_name}.features.pdf'
+    if os.path.exists(pdf_source):
+        shutil.copy(pdf_source, f'{result_dir}/results/{sample_name}.features.pdf')
+    else:
+        print(f"Warning: Features PDF not found at {pdf_source}, skipping copy.")
 
 
 def get_args():

@@ -9,7 +9,7 @@ suppressWarnings(suppressMessages(require(AnnotationDbi)))
 #       print("I did not find Rsubread so I am installing it...")
 #       BiocInstaller::biocLite("Rsubread",dependencies = TRUE, ask = FALSE)
 #     }else{
-#       if(all(as.numeric_version(packageVersion("Rsubread"))<'1.26.1')){
+#       if(all(as.numeric_version(packageVersion("Rsubread"))<\'1.26.1\')){
 #           print("I need newer Rsubread so I am updating it...")
 #           BiocInstaller::biocUpdatePackages("Rsubread", ask=FALSE)
 #        }
@@ -108,7 +108,6 @@ get_gr <- function(y){GenomicRanges::makeGRangesFromDataFrame(y,
                                     ignore.strand = FALSE) # made a change here.
 
 
-
   # Some entries will be NA in our pre_all vector.
   # Most likely represent exons on scaffolds or last exon in chromosome in either direction
   names(pre_all) <- 1:length(pre_all)                           # naming with position in vector
@@ -147,16 +146,17 @@ get_gr <- function(y){GenomicRanges::makeGRangesFromDataFrame(y,
 
   .extension_function <- function(x, pre_all, df){
     if (x %>%
-        dplyr::select(strand) %>%              # check to see if the strand in positive
+        dplyr::select(strand) %>%
         unique == "+"){
       strand_var <- "pos"                      # Assign strand variable to "pos"
       ind <- x %>%
-        dplyr::filter(end == max(end)) %>%     # finding the exon that has the max "end" value and
-        dplyr::pull(index)                     # pulling the index for this entry
-    } else {strand_var <- "neg"
-    ind <- x %>%                               # likewise, doing the opposite for negative stranded genes
-      dplyr::filter(start == min(start)) %>%
-      dplyr::pull(index)                       # pulling index for min most exon for negative strand
+        dplyr::filter(end == max(end)) %>%
+        dplyr::pull(index)
+    } else {
+      strand_var <- "neg"
+      ind <- x %>%
+        dplyr::filter(start == min(start)) %>%
+        dplyr::pull(index)                       # pulling index for min most exon for negative strand
     }
     if(is.na(pre_all[ind])){                   # pulling following exon of min/max exons in each list entry
       #print("NA value, skipping instance")     # check for NA values in pre_all vector
@@ -294,13 +294,13 @@ get_gr <- function(y){GenomicRanges::makeGRangesFromDataFrame(y,
   rm_ind <- plyranges::find_overlaps(gr.gene.dis,               # find overlapping ranges in same object from different genes, assign to "rm_ind"
                                      gr.gene.dis,
                                      minoverlap = 1) %>%
-    plyranges::filter(gene_id.x != gene_id.y) %>%               # because this is a self-comparison, filtering out genes that match each other
+    plyranges::filter(gene_id.x != gene_id.y) %>%
     data.frame() %>%
-    dplyr::pull(index.x) %>%                                    # pull indices, as these represent ranges that are overlapping and belong to
-    unique()                                                    # different genes.
+    dplyr::pull(index.x) %>%
+    unique()                                                    # different genes. 
 
   gr.gene.dis.filt <- gr.gene.dis %>%
-    plyranges::filter(!(index %in% rm_ind)) %>%  # removing based on "rm_ind"
+    plyranges::filter(!(index %in% rm_ind)) %>%
     plyranges::select(-index)                    # getting rid of index after removal, as we don't need anymore
 
   # this finds introns that are only inside of the disjoined gene's transcript object
@@ -410,11 +410,11 @@ get_gr <- function(y){GenomicRanges::makeGRangesFromDataFrame(y,
   ge <- gtf.dt[V3 == "gene"]
   gtf_info <- ge$V9
   parsed_info <- lapply(gtf_info, function(x) {
-    gene_id_match <- regmatches(x, regexpr('gene_id "([^"]+)"', x))
-    gene_name_match <- regmatches(x, regexpr('gene_name "([^"]+)"', x))
+    gene_id_match <- regmatches(x, regexpr('gene_id \"([^\"]+)\"", x))
+    gene_name_match <- regmatches(x, regexpr('gene_name \"([^\"]+)\"", x))
     
-    gene_id <- if (length(gene_id_match) > 0) sub('gene_id "([^"]+)"', '\\1', gene_id_match) else NA
-    gene_name <- if (length(gene_name_match) > 0) sub('gene_name "([^"]+)"', '\\1', gene_name_match) else NA
+    gene_id <- if (length(gene_id_match) > 0) sub('gene_id \"([^\"]+)\"", '\\1', gene_id_match) else NA
+    gene_name <- if (length(gene_name_match) > 0) sub('gene_name \"([^\"]+)\"", '\\1', gene_name_match) else NA
     
     if (is.na(gene_name)) gene_name <- gene_id
     if (is.na(gene_id)) gene_id <- gene_name
@@ -425,4 +425,3 @@ get_gr <- function(y){GenomicRanges::makeGRangesFromDataFrame(y,
   gene_info_dt <- rbindlist(parsed_info)
   return(gene_info_dt)
 }
-

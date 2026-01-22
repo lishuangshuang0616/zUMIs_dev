@@ -5,9 +5,18 @@ import yaml
 import subprocess
 import csv
 import gzip
-from collections import defaultdict
-import glob
-import math
+import shutil
+from collections import defaultdict, Counter
+import scipy.io
+import scipy.sparse
+import numpy as np
+import pandas as pd
+
+try:
+    import pysam
+except ImportError:
+    print("Error: 'pysam' module is required. Please install it via pip install pysam")
+    sys.exit(1)
 
 def load_config(yaml_file):
     with open(yaml_file, 'r') as f:
@@ -17,241 +26,263 @@ def hamming_distance(s1, s2):
     if len(s1) != len(s2): return len(s1)
     return sum(c1 != c2 for c1, c2 in zip(s1, s2))
 
-def parse_tags(tag_str):
-    tags = {}
-    for t in tag_str:
-        parts = t.split(':')
-        if len(parts) >= 3:
-            tags[parts[0]] = parts[2]
-    return tags
+def cluster_umis(umis, threshold=1):
+    if not umis: return {}
+    if threshold == 0:
+        return {u: u for u in umis}
 
-def umi_collapse(umis, threshold=1):
-    """
-    Simple adjacency-based UMI collapsing.
-    Returns count of unique molecules.
-    """
-    if not umis: return 0
-    if threshold == 0: return len(set(umis))
+    counts = Counter(umis)
+    unique_umis = sorted(counts.keys(), key=lambda x: (-counts[x], x))
     
-    # Sort by abundance (descending) to prioritize common UMIs as 'parents'
-    umi_counts = collections.Counter(umis)
-    sorted_umis = sorted(umi_counts.keys(), key=lambda x: umi_counts[x], reverse=True)
-    
-    kept_umis = []
-    
-    for umi in sorted_umis:
-        if not kept_umis:
-            kept_umis.append(umi)
-            continue
-            
-        # Check distance to already kept UMIs
-        # If close to any kept UMI, merge into it (discard current)
-        is_merged = False
-        for parent in kept_umis:
-            if hamming_distance(umi, parent) <= threshold:
-                is_merged = True
-                break
-        
-        if not is_merged:
-            kept_umis.append(umi)
-            
-    return len(kept_umis)
-
-# Optimized version of collapse using graph clustering is better but slower to implement in pure python without networkx.
-# Using a simple greedy approach:
-# 1. Take most abundant UMI.
-# 2. Remove all UMIs within distance d.
-# 3. Repeat.
-import collections
-
-def greedy_umi_collapse(umis, threshold=1):
-    if not umis: return 0
-    if threshold == 0: return len(set(umis))
-    
-    counts = collections.Counter(umis)
-    # Sort UMIs by count (desc) then by sequence (for stability)
-    sorted_umis = sorted(counts.keys(), key=lambda x: (-counts[x], x))
-    
-    unique_molecules = 0
-    
-    # We mark UMIs as visited
+    parent_map = {} 
     visited = set()
     
-    for i, umi in enumerate(sorted_umis):
-        if umi in visited:
-            continue
-            
-        unique_molecules += 1
-        visited.add(umi)
+    for parent in unique_umis:
+        if parent in visited: continue
+        parent_map[parent] = parent
+        visited.add(parent)
         
-        # Find network of errors
-        # To optimize, we only look at other UMIs if we haven't visited them
-        for other_umi in sorted_umis[i+1:]:
-            if other_umi in visited:
-                continue
+        children = []
+        for candidate in unique_umis:
+            if candidate in visited: continue
+            if hamming_distance(parent, candidate) <= threshold:
+                children.append(candidate)
+        
+        for child in children:
+            parent_map[child] = parent
+            visited.add(child)
             
-            if hamming_distance(umi, other_umi) <= threshold:
-                visited.add(other_umi)
-                
-    return unique_molecules
+    return parent_map
 
-def process_bam(bam_file, samtools_exec, ham_dist, threads, out_prefix, is_smart3=False):
-    """
-    Reads BAM, aggregates counts by (BC, Gene).
-    Outputs CSVs.
-    """
-    print(f"Processing {bam_file} with Hamming Distance {ham_dist}...")
+def write_sparse_matrix(counts_dict, gene_names_map, out_dir, subdir_name):
+    full_out_dir = os.path.join(out_dir, "zUMIs_output", "expression", subdir_name)
+    print(f"Generating sparse matrix in {full_out_dir}...")
     
-    # Data structures:
-    # counts[barcode][gene] = list_of_umis
-    # For smart-seq3 internal reads, we might just count reads?
-    # Based on zUMIs logic: internal reads are also counted.
+    if not os.path.exists(full_out_dir):
+        os.makedirs(full_out_dir)
     
-    umi_data = defaultdict(lambda: defaultdict(list))
-    read_data = defaultdict(lambda: defaultdict(int))
-    internal_data = defaultdict(lambda: defaultdict(int)) # For Smart-seq3 internal
+    barcodes = sorted(counts_dict.keys())
+    genes_set = set()
+    for bc in counts_dict:
+        genes_set.update(counts_dict[bc].keys())
+    genes = sorted(list(genes_set))
     
-    # Open BAM stream
-    # Using -F 0x4 (mapped only) is handled by featureCounts usually, but good to be safe.
-    # We need tags: BC, UB, XT (gene)
-    # If featureCounts used, gene tag might be 'XT'
+    gene_to_idx = {g: i for i, g in enumerate(genes)}
+    bc_to_idx = {b: i for i, b in enumerate(barcodes)}
     
-    cmd = [samtools_exec, 'view', '-@', str(threads), bam_file]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    rows = []
+    cols = []
+    data = []
     
-    line_count = 0
-    for line in proc.stdout:
-        line_count += 1
-        if line_count % 1000000 == 0:
-            print(f"Processed {line_count} reads...", end='\r')
-            
-        parts = line.strip().split('\t')
-        if len(parts) < 12: continue
-        
-        # Parse Tags
-        tags = {}
-        # Tags start from index 11
-        for t in parts[11:]:
-            if t.startswith('BC:Z:'): tags['BC'] = t[5:]
-            elif t.startswith('UB:Z:'): tags['UB'] = t[5:]
-            elif t.startswith('XT:Z:'): tags['XT'] = t[5:] # FeatureCounts gene
-            
-        bc = tags.get('BC')
-        gene = tags.get('XT')
-        umi = tags.get('UB')
-        
-        if not bc or not gene:
-            continue
-            
-        if gene == 'NA': continue # Unassigned
-        
-        # Check for Smart-seq3 internal reads
-        # zUMIs logic: if UMI is missing or pattern not matched?
-        # Actually in fqfilter.py we might have set UB to empty if it's internal.
-        
-        is_internal = False
-        if not umi:
-             is_internal = True
-        
-        # If specific Smart-seq3 logic is needed, we check here.
-        # Assuming UB present = UMI read. UB absent = Internal read.
-        
-        read_data[bc][gene] += 1
-        
-        if not is_internal:
-            umi_data[bc][gene].append(umi)
-        else:
-            if is_smart3:
-                internal_data[bc][gene] += 1
+    for bc, gene_counts in counts_dict.items():
+        bc_idx = bc_to_idx[bc]
+        for gene, count in gene_counts.items():
+            if count > 0:
+                gene_idx = gene_to_idx[gene]
+                rows.append(gene_idx)
+                cols.append(bc_idx)
+                data.append(count)
                 
-    print(f"\nFinished reading BAM. Total lines: {line_count}")
-    proc.wait()
-    if proc.returncode != 0:
-        stderr = proc.stderr.read().strip() if proc.stderr else ""
-        raise RuntimeError(f"samtools view failed (rc={proc.returncode}) for {bam_file}: {stderr}")
-    try:
-        if proc.stdout:
-            proc.stdout.close()
-    except Exception:
-        pass
-    try:
-        if proc.stderr:
-            proc.stderr.close()
-    except Exception:
-        pass
+    mat = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(len(genes), len(barcodes)))
     
-    # Collapse and Write
-    print("Collapsing UMIs and writing outputs...")
+    matrix_file = os.path.join(full_out_dir, "matrix.mtx")
+    scipy.io.mmwrite(matrix_file, mat)
+    with open(matrix_file, 'rb') as f_in:
+        with gzip.open(matrix_file + ".gz", 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    os.remove(matrix_file)
     
-    # Write UMI counts
-    with open(f"{out_prefix}.dgecounts.csv", 'w') as f:
-        f.write("Gene,Barcode,Count\n")
-        for bc, genes in umi_data.items():
-            for gene, umis in genes.items():
-                count = greedy_umi_collapse(umis, ham_dist)
-                f.write(f"{gene},{bc},{count}\n")
+    with gzip.open(os.path.join(full_out_dir, "barcodes.tsv.gz"), "wt") as f:
+        for bc in barcodes:
+            f.write(f"{bc}\n")
+            
+    with gzip.open(os.path.join(full_out_dir, "features.tsv.gz"), "wt") as f:
+        for g_id in genes:
+            g_name = gene_names_map.get(g_id, g_id)
+            f.write(f"{g_id}\t{g_name}\tGene Expression\n")
+
+def process_bam_and_matrix(bam_file, out_bam, config, threads):
+    project = config['project']
+    out_dir = config['out_dir']
+    ham_dist = int(config['counting_opts'].get('Ham_Dist', 0))
+    count_introns = config.get('counting_opts', {}).get('introns', True)
+    
+    print(f"Processing {bam_file}")
+    
+    # Structure: data[category][barcode][gene] = list_of_umis
+    umi_data = {
+        'exon': defaultdict(lambda: defaultdict(list)),
+        'intron': defaultdict(lambda: defaultdict(list))
+    }
+    
+    # Structure: read_counts_raw[category][barcode][gene] = int
+    # Counts raw reads BEFORE UMI collapsing
+    read_counts_raw = {
+        'exon': defaultdict(lambda: defaultdict(int)),
+        'intron': defaultdict(lambda: defaultdict(int))
+    }
+    
+    gene_names_map = {} 
+    correction_map = defaultdict(lambda: defaultdict(dict))
+    
+    print("Pass 1: Reading BAM to aggregate UMIs and Reads...")
+    with pysam.AlignmentFile(bam_file, "rb", threads=threads) as bam:
+        for read in bam:
+            if read.is_unmapped: continue
+            try:
+                bc = read.get_tag("BC")
+                gene_id = read.get_tag("XT")
+            except KeyError:
+                continue 
+            
+            if read.has_tag("GN"):
+                gene_names_map[gene_id] = read.get_tag("GN")
+            elif gene_id not in gene_names_map:
+                gene_names_map[gene_id] = gene_id
+            
+            ftype = "exon"
+            if read.has_tag("XF"):
+                xf = read.get_tag("XF")
+                if xf == "Intron": ftype = "intron"
+                elif xf == "Exon": ftype = "exon"
+                else: continue
+            
+            if not count_introns and ftype == 'intron': continue
+            
+            # Increment raw read count
+            read_counts_raw[ftype][bc][gene_id] += 1
+            
+            # Store UMI
+            if read.has_tag("UB"):
+                umi_data[ftype][bc][gene_id].append(read.get_tag("UB"))
+
+    print("Pass 1 Complete. Calculating Statistics...")
+
+    # Final count containers
+    final_umi_counts = {
+        'exon': defaultdict(lambda: defaultdict(int)),
+        'intron': defaultdict(lambda: defaultdict(int)),
+        'inex': defaultdict(lambda: defaultdict(int))
+    }
+    
+    final_read_counts = {
+        'exon': read_counts_raw['exon'],
+        'intron': read_counts_raw['intron'],
+        'inex': defaultdict(lambda: defaultdict(int))
+    }
+
+    # Calculate Inex Read Counts (Sum of Exon + Intron)
+    # Reads are mutually exclusive in BAM (a read is either Exon OR Intron), so simple sum works.
+    all_bcs_reads = set(read_counts_raw['exon'].keys()) | set(read_counts_raw['intron'].keys())
+    for bc in all_bcs_reads:
+        genes_exon = set(read_counts_raw['exon'].get(bc, {}).keys())
+        genes_intron = set(read_counts_raw['intron'].get(bc, {}).keys())
+        all_genes = genes_exon | genes_intron
+        for gene in all_genes:
+            c_ex = read_counts_raw['exon'].get(bc, {}).get(gene, 0)
+            c_in = read_counts_raw['intron'].get(bc, {}).get(gene, 0)
+            final_read_counts['inex'][bc][gene] = c_ex + c_in
+
+    # Calculate UMI Counts (with Clustering)
+    all_bcs_umis = set(umi_data['exon'].keys()) | set(umi_data['intron'].keys())
+    total_bcs = len(all_bcs_umis)
+    
+    for i, bc in enumerate(all_bcs_umis):
+        if i % 100 == 0: print(f"Clustering Barcode {i}/{total_bcs}...", end='\r')
+        
+        genes_exon = set(umi_data['exon'].get(bc, {}).keys())
+        genes_intron = set(umi_data['intron'].get(bc, {}).keys())
+        all_genes = genes_exon | genes_intron
+        
+        for gene in all_genes:
+            umis_ex = umi_data['exon'].get(bc, {}).get(gene, [])
+            umis_in = umi_data['intron'].get(bc, {}).get(gene, [])
+            umis_total = umis_ex + umis_in
+            if not umis_total: continue
+            
+            mapping = cluster_umis(umis_total, threshold=ham_dist)
+            if ham_dist > 0:
+                correction_map[bc][gene] = mapping
+            
+            # Count Unique Corrected UMIs
+            unique_total = set([mapping[u] for u in umis_total])
+            final_umi_counts['inex'][bc][gene] = len(unique_total)
+            
+            if umis_ex:
+                unique_ex = set([mapping[u] for u in umis_ex])
+                final_umi_counts['exon'][bc][gene] = len(unique_ex)
+            
+            if umis_in:
+                unique_in = set([mapping[u] for u in umis_in])
+                final_umi_counts['intron'][bc][gene] = len(unique_in)
+
+    print("\nWriting Matrices...")
+    
+    # Write UMI Counts
+    write_sparse_matrix(final_umi_counts['exon'], gene_names_map, out_dir, f"{project}.exon.umi")
+    if count_introns:
+        write_sparse_matrix(final_umi_counts['intron'], gene_names_map, out_dir, f"{project}.intron.umi")
+        write_sparse_matrix(final_umi_counts['inex'], gene_names_map, out_dir, f"{project}.inex.umi")
+        
+    # Write Read Counts
+    write_sparse_matrix(final_read_counts['exon'], gene_names_map, out_dir, f"{project}.exon.read")
+    if count_introns:
+        write_sparse_matrix(final_read_counts['intron'], gene_names_map, out_dir, f"{project}.intron.read")
+        write_sparse_matrix(final_read_counts['inex'], gene_names_map, out_dir, f"{project}.inex.read")
+    
+    # --- PASS 2: BAM Correction ---
+    print("Pass 2: Writing corrected BAM...")
+    tmp_bam_name = out_bam + ".tmp.bam"
+    
+    with pysam.AlignmentFile(bam_file, "rb", threads=threads) as infile:
+        with pysam.AlignmentFile(tmp_bam_name, "wb", template=infile, threads=threads) as outfile:
+            for read in infile:
+                # Process UMI tags if UB exists (Apply to ALL runs, Ham_Dist 0 or >0)
+                if read.has_tag("UB"):
+                    raw_umi = read.get_tag("UB")
+                    # Always set UX to raw UMI
+                    read.set_tag("UX", raw_umi)
+                    
+                    # Check if assigned to gene
+                    if read.has_tag("BC") and read.has_tag("XT"):
+                        bc = read.get_tag("BC")
+                        gene = read.get_tag("XT")
+                        
+                        # Apply correction to UB if available (only relevant if Ham_Dist > 0)
+                        if ham_dist > 0:
+                            if bc in correction_map and gene in correction_map[bc]:
+                                if raw_umi in correction_map[bc][gene]:
+                                    corrected_umi = correction_map[bc][gene][raw_umi]
+                                    read.set_tag("UB", corrected_umi)
+                        # else: UB remains raw_umi (correct behavior for Ham_Dist=0)
+                    else:
+                        # NOT assigned to gene: Remove UB tag
+                        read.set_tag("UB", None)
                 
-    # Write Read counts
-    with open(f"{out_prefix}.readcounts.csv", 'w') as f:
-        f.write("Gene,Barcode,Count\n")
-        for bc, genes in read_data.items():
-            for gene, count in genes.items():
-                f.write(f"{gene},{bc},{count}\n")
-                
-    if is_smart3:
-        with open(f"{out_prefix}.internal_readcounts.csv", 'w') as f:
-            f.write("Gene,Barcode,Count\n")
-            for bc, genes in internal_data.items():
-                for gene, count in genes.items():
-                    f.write(f"{gene},{bc},{count}\n")
+                outfile.write(read)
+    
+    print(f"Sorting corrected BAM to {out_bam}...")
+    pysam.sort("-@", str(threads), "-o", out_bam, tmp_bam_name)
+    if os.path.exists(tmp_bam_name): os.remove(tmp_bam_name)
+    print("Indexing...")
+    pysam.index(out_bam)
 
 def main():
     if len(sys.argv) < 3:
         print("Usage: python3 dge_analysis.py <yaml_config> <samtools_exec>")
         sys.exit(1)
-        
     yaml_file = sys.argv[1]
-    samtools = sys.argv[2]
-    
     config = load_config(yaml_file)
     project = config['project']
     out_dir = config['out_dir']
-    num_threads = config['num_threads']
-    ham_dist = config['counting_opts'].get('Ham_Dist', 0)
-    
-    # Determine input BAM (output of featureCounts)
-    # The R script names it: project.filtered.Aligned.GeneTagged.bam
-    # Wait, R script sorts it to: project.filtered.Aligned.GeneTagged.sorted.bam
-    
-    # We need to coordinate with the modified R script.
-    # Let's assume R script generates: out_dir/project.filtered.Aligned.GeneTagged.bam
-    
-    bam_file = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
-    
-    if not os.path.exists(bam_file):
-        # Maybe it is sorted?
-        bam_file = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.sorted.bam")
-        
-    if not os.path.exists(bam_file):
-        print(f"Error: Input BAM not found: {bam_file}")
+    num_threads = int(config.get('num_threads', 1))
+    input_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
+    if not os.path.exists(input_bam):
+        print(f"Error: Input BAM {input_bam} not found.")
         sys.exit(1)
-        
-    # Check for Smart-seq3
-    # Original logic: check if sequence files contain pattern "ATTGCGCAATG"
-    # We can pass this as arg or check config
-    is_smart3 = False
-    # Simplified check
-    seq_files = config.get('sequence_files', {})
-    for k, v in seq_files.items():
-        if 'find_pattern' in v and "ATTGCGCAATG" in str(v['find_pattern']):
-            is_smart3 = True
-            break
-            
-    out_prefix = os.path.join(out_dir, "zUMIs_output", "expression", project)
-    if not os.path.exists(os.path.dirname(out_prefix)):
-        os.makedirs(os.path.dirname(out_prefix))
-        
-    process_bam(bam_file, samtools, int(ham_dist), num_threads, out_prefix, is_smart3)
+    final_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.UBcorrected.sorted.bam")
+    process_bam_and_matrix(input_bam, final_bam, config, threads=num_threads)
+    print("DGE Analysis pipeline finished.")
 
 if __name__ == "__main__":
     main()

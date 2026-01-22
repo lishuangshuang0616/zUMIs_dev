@@ -62,11 +62,11 @@ saf<-.makeSAF(gtf = paste0(opt$out_dir,"/",opt$project,".final_annot.gtf"),
               scaff_length = opt$reference$scaffold_length_min,
               multi_overlap_var = opt$counting_opts$multi_overlap,
               samtoolsexc = samtoolsexc)
-try(gene_name_mapping <- .get_gene_names(gtf = paste0(opt$out_dir,"/",opt$project,".final_annot.gtf")), silent = TRUE)
+try(gene_name_mapping <- .get_gene_names(gtf = paste0(opt$out_dir,"/",opt$project,".final_annot.gtf"), threads = opt$num_threads), silent = TRUE)
 try(data.table::fwrite(gene_name_mapping, file = paste0(opt$out_dir,"/zUMIs_output/expression/",opt$project,".gene_names.txt"), sep ="\t", quote = FALSE), silent = TRUE)
 ##
 
-if(opt$counting_opts$strand == 1){
+if(smart3_flag & opt$counting_opts$strand == 1){
   #split bam in UMU ends and internal
   print("Preparing Smart-seq3 data for stranded gene assignment...")
   print(Sys.time())
@@ -125,15 +125,168 @@ if(is.null(opt$mem_limit)){
 }
 
 
-# === PYTHON HANDOVER ===
-# The following R logic for sorting, UMI collapsing, and counting is disabled.
-# It is now handled by dge_analysis.py for better performance.
-print("R script finished FeatureCounts. Handing over to Python for UMI processing.")
+if(opt$counting_opts$Ham_Dist == 0){
+  sortbamfile <-paste0(opt$out_dir,"/",opt$project,".filtered.Aligned.GeneTagged.sorted.bam")
+  print(Sys.time())
+  print("Coordinate sorting final bam file...")
+  sort_cmd <- paste0(samtoolsexc," sort -O 'BAM' -@ ",opt$num_threads," -m ",mempercpu,"G -o ",sortbamfile," ",outbamfile)
+  system(sort_cmd)
+  system(paste0("rm ",outbamfile))
+}else{
+  #run hamming distance collapsing here and write output into bam file
+  if(!dir.exists( paste0(opt$out_dir,"/zUMIs_output/molecule_mapping/") )){
+    dir.create( paste0(opt$out_dir,"/zUMIs_output/molecule_mapping/") )
+  }
+
+  tmpbamfile <- outbamfile
+  outbamfile <- paste0(opt$out_dir,"/",opt$project,".filtered.Aligned.GeneTagged.sorted.bam")
+  print(Sys.time())
+  print("Coordinate sorting intermediate bam file...")
+  sort_cmd <- paste0(samtoolsexc," sort -O 'BAM' -@ ",opt$num_threads," -m ",mempercpu,"G -o ",outbamfile," ",tmpbamfile)
+  system(sort_cmd)
+  index_cmd <- paste(samtoolsexc,"index -@",opt$num_threads,outbamfile)
+  system(index_cmd)
+  system(paste0("rm ",tmpbamfile))
+  print(Sys.time())
+
+  #check if PE / SE flag is set correctly
+  if(is.null(opt$read_layout)){
+    opt$read_layout <- check_read_layout(outbamfile)
+  }
+
+  for(i in unique(bccount$chunkID)){
+    print( paste( "Hamming distance collapse in barcode chunk", i, "out of",length(unique(bccount$chunkID)) ))
+    reads <- reads2genes_new(featfile = outbamfile,
+                             bccount  = bccount,
+                             inex     = opt$counting_opts$introns,
+                             chunk    = i,
+                             cores    = opt$num_threads)
+    reads <- reads[!UB==""] #make sure only UMI-containing reads go further
+    u <- umiCollapseHam(reads,bccount, HamDist=opt$counting_opts$Ham_Dist)
+  }
+  #print("Demultiplexing output bam file by cell barcode...")
+  #demultiplex_bam(opt, outbamfile, nBCs = length(unique(bccount$XC)), bccount = bccount, samtoolsexc = samtoolsexc)
+  print("Correcting UMI barcode tags...")
+  sortbamfile <- correct_UB_tags_new(outbamfile, opt$project)
+  file.remove(outbamfile)
+  #sortbamfile <- correct_UB_tags(bccount, samtoolsexc)
+  #sortbamfile <-paste0(opt$out_dir,"/",opt$project,".filtered.Aligned.GeneTagged.UBcorrected.sorted.bam")
+  bccount<-splitRG(bccount=bccount, mem= opt$mem_limit, hamdist = 0) # allow more reads to be in RAM fur subsequent steps
+}
+index_cmd <- paste(samtoolsexc,"index -@",opt$num_threads,sortbamfile)
+system(index_cmd)
 print(Sys.time())
+
+#check if PE / SE flag is set correctly
+if(is.null(opt$read_layout)){
+  opt$read_layout <- check_read_layout(sortbamfile)
+}
+
+##########################################
+#set Downsampling ranges
+
+data.table::setDTthreads(threads=opt$num_threads)
+
+subS<-setDownSamplingOption( opt$counting_opts$downsampling,
+                             bccount= bccount,
+                             filename=paste(opt$out_dir,"/zUMIs_output/stats/",opt$project,
+                                            ".downsampling_thresholds.pdf",sep=""))
+print("Here are the detected subsampling options:")
+if(is.null(row.names(subS))){
+  print("Automatic downsampling")
+}else{
+  print(row.names(subS))
+}
+if( opt$counting_opts$introns ){
+  mapList<-list("exon"="exon",
+                "inex"=c("intron","exon"),
+                "intron"="intron")
+}else{
+  mapList<-list("exon"="exon")
+}
+
+
+########################## assign reads to UB & GENE
+
+for(i in unique(bccount$chunkID)){
+     print( paste( "Working on barcode chunk", i, "out of",length(unique(bccount$chunkID)) ))
+     print( paste( "Processing",length(bccount[chunkID==i]$XC), "barcodes in this chunk..." ))
+     reads <- reads2genes_new(featfile = sortbamfile,
+                              bccount  = bccount,
+                              inex     = opt$counting_opts$introns,
+                              chunk    = i,
+                              cores    = opt$num_threads)
+
+     tmp<-collectCounts(  reads =reads,
+                          bccount=bccount[chunkID==i],
+                          subsample.splits=subS[which(max(bccount[chunkID==i]$n) >= subS[,1]), , drop = FALSE],
+                          mapList=mapList
+                        )
+
+     if(i==1){
+       allC<-tmp
+    }else{
+       allC<-bindList(alldt=allC,newdt=tmp)
+    }
+}
+
+if( UMIcheck == "UMI"  ){
+  if(smart3_flag){
+    final<-list( umicount  = convert2countM(alldt=allC,what="umicount"),
+                 readcount = convert2countM(allC,"readcount"),
+                 readcount_internal = convert2countM(allC,"readcount_internal"))
+  }else{
+    final<-list( umicount  = convert2countM(alldt=allC,what="umicount"),
+                 readcount = convert2countM(allC,"readcount"))
+  }
+}else{
+  final<-list(readcount = convert2countM(allC,"readcount"))
+}
+
+#Make RPKM if necessary
+if(UMIcheck == "nonUMI" | smart3_flag == TRUE ){
+  tx_len <- .get_tx_lengths( paste0(opt$out_dir,"/",opt$project,".final_annot.gtf") )
+  rpkms <- if(smart3_flag){
+    RPKM.calc(final$readcount_internal$exon$all, tx_len)
+  }else{
+    RPKM.calc(final$readcount$exon$all, tx_len)
+  }
+
+  final$rpkm <- list(exon = list(all = rpkms))
+}
+
+saveRDS(final,file=paste(opt$out_dir,"/zUMIs_output/expression/",opt$project,".dgecounts.rds",sep=""))
+
+################# #Accessory processing scripts
+#Intron Probability Score Calculation
+if(opt$counting_opts$intronProb == TRUE){
+  if(opt$counting_opts$introns == FALSE){
+    print("Intron information is needed to calculate Intron-Probability! Please change yaml settings counting_opts->introns to yes.\n Skipping probability calculation...")
+  }else{
+    library(extraDistr)
+    print("Starting Intron-Probability Calculations...")
+
+    # Extractingreads from sam files again, this could be sped up by integrating code further upstream of zUMIs-dge2
+    genesWithIntronProb<-.intronProbability(bccount=bccount,
+                                            featfile=sortbamfile,
+                                            inex=opt$counting_opts$introns,
+                                            cores=opt$num_threads,
+                                            samtoolsexc=samtoolsexc,
+                                            allC=allC,
+                                            saf=saf)
+    saveRDS(genesWithIntronProb, file = paste0(opt$out_dir,"/zUMIs_output/stats/",opt$project,".intronProbability.rds"))
+  }
+}
+
+#demultiplexing
+if(opt$barcodes$demultiplex){
+  print("Demultiplexing output bam file by cell barcode...")
+  demultiplex_bam(opt, sortbamfile, nBCs = length(unique(bccount$XC)), bccount = bccount, samtoolsexc = samtoolsexc)
+}
+
+#################
+
+print(Sys.time())
+print(paste("I am done!! Look what I produced...",opt$out_dir,"/zUMIs_output/",sep=""))
+print(gc())
 q()
-
-# OLD CODE COMMENTED OUT FOR REFERENCE
-# if(opt$counting_opts$Ham_Dist == 0){
-#   sortbamfile <-paste0(opt$out_dir,"/",opt$project,".filtered.Aligned.GeneTagged.sorted.bam")
-# ... (rest of the file)
-
