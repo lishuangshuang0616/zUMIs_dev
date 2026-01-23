@@ -51,15 +51,16 @@ def load_id_map(id_map_file):
     return id_map, internal_bcs
 
 def main():
-    if len(sys.argv) < 4:
-        # Args: 1:in_bam, 2:out_bam, 3:binmap1, 4+:id_map
-        print("Usage: python3 correct_BCtag.py <inbam> <outbam> <BCbinmap> [ID_map_file]")
+    if len(sys.argv) < 5:
+        # Args: 1:in_bam, 2:out_bam_umi, 3:out_bam_internal, 4:binmap1, 5+:id_map
+        print("Usage: python3 correct_BCtag.py <inbam> <outbam_umi> <outbam_internal> <BCbinmap> [ID_map_file]")
         sys.exit(1)
 
     in_bam = sys.argv[1]
-    out_bam = sys.argv[2]
-    binmap = sys.argv[3]  
-    id_map_file = sys.argv[4]
+    out_bam_umi = sys.argv[2]
+    out_bam_internal = sys.argv[3]
+    binmap = sys.argv[4]  
+    id_map_file = sys.argv[5]
 
     print(f"Loading maps... (BCbinmap: {bool(binmap)}, ID_Map: {bool(id_map_file)})")
     bc_map = load_bc_map(binmap)
@@ -88,7 +89,8 @@ def main():
     else:
         header['PG'] = [pg_entry]
         
-    outfile = pysam.AlignmentFile(out_bam, "wb", header=header)
+    outfile_umi = pysam.AlignmentFile(out_bam_umi, "wb", header=header)
+    outfile_int = pysam.AlignmentFile(out_bam_internal, "wb", header=header)
 
     processed = 0
     
@@ -99,7 +101,7 @@ def main():
 
         try:
             try:
-                raw_bc = read.get_tag("BC")
+                raw_bc = read.get_tag("CR")
                 if isinstance(raw_bc, str):
                     raw_bc = raw_bc.upper()
                 else:
@@ -107,8 +109,14 @@ def main():
             except KeyError:
                 raw_bc = None
             
+            # If no barcode, where should it go? Usually discard or put in one.
+            # Assuming discard if critical tags missing, but here we just write to UMI default or skip?
+            # Original code: if not raw_bc: outfile.write(read) -> assume UMI file for "junk"?
+            # Let's write to UMI file as default for uncorrectable reads to keep flow safe, 
+            # or skip if they are useless. 
+            # Original code continued: if not raw_bc: outfile.write(read); continue
             if not raw_bc:
-                outfile.write(read)
+                outfile_umi.write(read)
                 continue
 
             correct_bc = bc_map.get(raw_bc, raw_bc)
@@ -136,8 +144,8 @@ def main():
                 # ---------- Internal read ----------
                 else:
                     try:
-                        ub = read.get_tag("UB")
-                        qu = read.get_tag("QU")
+                        ub = read.get_tag("UR")
+                        qu = read.get_tag("UY")
                     except KeyError:
                         ub, qu = None, None
 
@@ -155,22 +163,22 @@ def main():
                         read.query_sequence = new_seq
                         read.query_qualities = new_qual
                         # clear tags
-                        read.set_tag("UB", None)
-                        read.set_tag("QU", None)
+                        read.set_tag("UR", None)
+                        read.set_tag("UY", None)
 
             # -------------------------
             # R2: flag == 141
             # -------------------------
             elif flag == 141:
                 if is_internal:
-                    read.set_tag("UB", None)
-                    read.set_tag("QU", None)
+                    read.set_tag("UR", None)
+                    read.set_tag("UY", None)
 
             # -------------------------
             # Set tags
             # -------------------------
-            # BX: Original raw barcode (Always kept)
-            read.set_tag("BX", raw_bc)
+            # CR: Original raw barcode (Always kept)
+            read.set_tag("CR", raw_bc)
             
             final_bc_out = None
             if id_map:
@@ -178,22 +186,28 @@ def main():
 
             if final_bc_out:
                 # Valid cell found in ID map
-                read.set_tag("BZ", correct_bc)   # Corrected Sequence
-                read.set_tag("BC", final_bc_out) # Well ID
+                read.set_tag("CC", correct_bc)   # Corrected Sequence
+                read.set_tag("CB", final_bc_out) # Well ID
             else:
                 # Invalid/Junk cell
                 # Remove tags if they exist to keep BAM clean
-                read.set_tag("BZ", None)
-                read.set_tag("BC", None)
+                read.set_tag("CC", None)
+                read.set_tag("CB", None)
 
-            outfile.write(read)
+            # Write to appropriate file
+            if is_internal:
+                outfile_int.write(read)
+            else:
+                outfile_umi.write(read)
 
         except Exception as e:
             # sys.stderr.write(f"Warning: error processing read {read.query_name}: {e}\n")
-            outfile.write(read)
+            # Write error reads to UMI as safe fallback
+            outfile_umi.write(read)
             
     infile.close()
-    outfile.close()
+    outfile_umi.close()
+    outfile_int.close()
 
 if __name__ == "__main__":
     main()

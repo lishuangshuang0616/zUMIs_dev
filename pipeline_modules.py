@@ -136,7 +136,7 @@ def merge_bam_stats(tmp_dir, project, out_dir, yaml_file, samtools_exec):
             outfile.write(f"{bc}\t{bc_counts[bc]}\n")
                 
     # 2. Check Layout
-    bam_files = glob.glob(os.path.join(tmp_dir, f"{project}.*.filtered.tagged.bam"))
+    bam_files = glob.glob(os.path.join(tmp_dir, f"{project}.*.raw.tagged.bam"))
     if not bam_files:
         print("No BAM files found to check layout.")
         return

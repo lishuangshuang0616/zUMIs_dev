@@ -153,7 +153,7 @@ def main():
     else:
         umi_filter = list(map(int, str(config['filter_cutoffs']['UMI_filter']).split()))
     
-    out_bam = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{project}.{tmp_prefix}.filtered.tagged.bam")
+    out_bam = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{project}.{tmp_prefix}.raw.tagged.bam")
     out_bc_stats = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{project}.{tmp_prefix}.BCstats.txt")
 
     pigz_procs = []
@@ -256,10 +256,10 @@ def main():
                 rid = rid[1:]
             
             tags = (
-                b"\tBC:Z:" + final_bc +
-                b"\tUB:Z:" + final_umi +
-                b"\tQB:Z:" + final_bc_q +
-                b"\tQU:Z:" + final_umi_q +
+                b"\tCR:Z:" + final_bc +
+                b"\tUR:Z:" + final_umi +
+                b"\tCY:Z:" + final_bc_q +
+                b"\tUY:Z:" + final_umi_q +
                 b"\n"
             )
             

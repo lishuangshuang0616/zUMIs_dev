@@ -161,15 +161,16 @@ def run_featurecounts_cmd(input_bam, saf_file, out_prefix, threads, strand_mode,
     
     return target_bam
 
-def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, gene_map=None):
+def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, gene_map=None, source_label=None):
     """
     Merges Exon and Intron BAMs.
     Priority: Exon > Intron.
-    Adds XF:Z:Exon/Intron/Intergenic tag.
-    Adds GN:Z:GeneName tag based on XT tag and gene_map.
+    Adds RE:Z:E/N/I tag.
+    Adds GN:Z:GeneName tag based on GX tag and gene_map.
+    Adds SR:Z:Source tag (UMI/Internal) if provided.
     Input BAMs are sorted by name to ensure sync.
     """
-    print(f"Merging Exon and Intron BAMs into {out_bam} (Sorting by name first)...")
+    print(f"Merging Exon and Intron BAMs into {out_bam} (Source: {source_label})...")
     
     sort_threads = max(1, int(threads) // 2)
     # Sort by name (-n) and output SAM to stdout (-O sam)
@@ -189,8 +190,6 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
     header_lines = []
     
     # Process header
-    # Optimization: We only need header from one stream (ex) and consume the other (in)
-    
     while True:
         line = proc_ex.stdout.readline()
         if not line: break
@@ -214,21 +213,7 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
             if count % 1000000 == 0: print(f"Merged {count} reads...", end='\r')
             
             # Fast sync check (Read ID is first column)
-            # Find first tab
             tab_ex = read_line_ex.find('\t')
-            # tab_in = read_line_in.find('\t') # Assume in sync, skip parsing for speed if ID check is expensive
-            
-            # Optimization: Only parse ID if we are paranoid. 
-            # Assuming samtools sort -n produces deterministic order.
-            # But let's keep ID check for safety but optimize string slicing
-            
-            id_ex = read_line_ex[:tab_ex]
-            # id_in = read_line_in[:read_line_in.find('\t')] 
-            
-            # if id_ex != id_in:
-            #     # Fallback check
-            #     print(f"\nError: BAMs out of sync at line {count}! {id_ex}")
-            #     sys.exit(1)
             
             # Check assignments (XT tag)
             # Optimization: check substring existence directly without full split
@@ -238,28 +223,46 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
             
             if has_xt_ex:
                 # Exon priority
-                final_line = read_line_ex.rstrip() + "\tXF:Z:Exon"
-                # Skip reading 'in' line details, just move pointer
+                final_line = read_line_ex.rstrip().replace('XT:Z:', 'GX:Z:') + "\tRE:Z:E"
             else:
                 has_xt_in = 'XT:Z:' in read_line_in
                 if has_xt_in:
                     # Intron priority
-                    final_line = read_line_in.rstrip() + "\tXF:Z:Intron"
+                    final_line = read_line_in.rstrip().replace('XT:Z:', 'GX:Z:') + "\tRE:Z:N"
                 else:
-                    # Unassigned
-                    start_flag = tab_ex + 1
-                    end_flag = read_line_ex.find('\t', start_flag)
-                    flag = int(read_line_ex[start_flag:end_flag])
+                    # Unassigned - Try to find detailed reason in XS tag
+                    # XS:Z:Unassigned_Ambiguity, etc.
+                    reason = None
+                    xs_pos = read_line_ex.find('XS:Z:')
+                    if xs_pos != -1:
+                        xs_end = read_line_ex.find('\t', xs_pos)
+                        reason = read_line_ex[xs_pos+5 : xs_end] if xs_end != -1 else read_line_ex[xs_pos+5:]
                     
-                    xf_val = "Unmapped" if (flag & 0x4) else "Intergenic"
-                    final_line = read_line_ex.rstrip() + f"\tXF:Z:{xf_val}"
+                    if reason and "Unassigned_" in reason:
+                        # Map to a clean status like "Ambiguity" or "MultiMapping"
+                        status = reason.replace("Unassigned_", "")
+                        if status == "NoFeatures": status = "I"
+                        final_line = read_line_ex.rstrip() + f"\tRE:Z:{status}"
+                    else:
+                        start_flag = tab_ex + 1
+                        end_flag = read_line_ex.find('\t', start_flag)
+                        flag = int(read_line_ex[start_flag:end_flag])
+                        
+                        if not (flag & 0x4):
+                            final_line = read_line_ex.rstrip() + "\tRE:Z:I"
+                        else:
+                            final_line = read_line_ex.rstrip() + "\tRE:Z:Unmapped"
             
-            # Add GN tag if gene_map is provided and XT tag exists
-            if gene_map and ('XT:Z:' in final_line):
-                # Extract Gene ID from XT tag
-                # Format XT:Z:GeneID
-                start_xt = final_line.find('XT:Z:') + 5
-                # Find end of XT tag (tab or end of line)
+            # Add Source Tag
+            if source_label:
+                final_line += f"\tSR:Z:{source_label}"
+
+            # Add GN tag if gene_map is provided and GX tag exists
+            if gene_map and ('GX:Z:' in final_line):
+                # Extract Gene ID from GX tag
+                # Format GX:Z:GeneID
+                start_xt = final_line.find('GX:Z:') + 5
+                # Find end of GX tag (tab or end of line)
                 end_xt = final_line.find('\t', start_xt)
                 if end_xt == -1:
                     gene_id = final_line[start_xt:]
@@ -270,8 +273,6 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
                 final_line += f"\tGN:Z:{gene_name}"
             
             proc_out.stdin.write(final_line + "\n")
-            
-            # Read next
             
             # Read next
             read_line_ex = proc_ex.stdout.readline()
@@ -306,12 +307,12 @@ def split_bam_smartseq3(bam_file, threads, samtools_exec):
                  pysam.AlignmentFile(internal_bam, "wb", template=infile, threads=write_threads) as out_int:
                 
                 for read in infile:
-                    # Check for UB tag
-                    if read.has_tag('UB'):
+                    # Check for UR tag
+                    if read.has_tag('UR'):
                         # Ideally check if not empty, but has_tag usually implies existence.
                         # zUMIs logic: UB must not be empty. 
                         # pysam returns value.
-                        val = read.get_tag('UB')
+                        val = read.get_tag('UR')
                         if val: 
                             out_umi.write(read)
                         else:
@@ -346,9 +347,9 @@ def split_bam_smartseq3(bam_file, threads, samtools_exec):
                 proc_int.stdin.write(line)
                 continue
             
-            # Logic: UB tag present and not empty -> UMI, else Internal
-            # 'UB:Z:' indicates presence. 'UB:Z:\t' indicates empty (followed by tab separator).
-            if 'UB:Z:' in line and 'UB:Z:\t' not in line:
+            # Logic: UR tag present and not empty -> UMI, else Internal
+            # 'UR:Z:' indicates presence. 'UR:Z:\t' indicates empty (followed by tab separator).
+            if 'UR:Z:' in line and 'UR:Z:\t' not in line:
                 proc_umi.stdin.write(line)
             else:
                 proc_int.stdin.write(line)
@@ -371,36 +372,51 @@ def split_bam_smartseq3(bam_file, threads, samtools_exec):
     return internal_bam, umi_bam
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 run_featurecounts.py <yaml_config>")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('yaml_file')
+    parser.add_argument('--umi_bam', required=False, help="Aligned UMI BAM")
+    parser.add_argument('--internal_bam', required=False, help="Aligned Internal BAM")
+    args = parser.parse_args()
         
-    yaml_file = sys.argv[1]
+    yaml_file = args.yaml_file
     config = load_config(yaml_file)
     
     check_dependencies()
     
     project = config['project']
     out_dir = config['out_dir']
-    num_threads = config.get('num_threads', 4)
+    num_threads = int(config.get('num_threads', 4))
     samtools_exec = config.get('samtools_exec', 'samtools')
     gtf_file = os.path.join(out_dir, f"{project}.final_annot.gtf")
     
-    input_bam = os.path.join(out_dir, f"{project}.filtered.tagged.Aligned.out.bam")
     final_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
     
     counting_opts = config.get('counting_opts', {})
-    strand_opt = counting_opts.get('strand', 0)
     count_introns = counting_opts.get('introns', True)
     
     print(f"Processing Project: {project}")
-    print(f"Input BAM: {input_bam}")
     
-    if not os.path.exists(input_bam):
-        print(f"Error: Input BAM not found: {input_bam}")
-        sys.exit(1)
+    umi_bam = args.umi_bam
+    internal_bam = args.internal_bam
+    
+    if not umi_bam or not internal_bam:
+        # Fallback if arguments missing (legacy support or manual run?)
+        umi_bam = os.path.join(out_dir, f"{project}.filtered.tagged.umi.Aligned.out.bam")
+        internal_bam = os.path.join(out_dir, f"{project}.filtered.tagged.internal.Aligned.out.bam")
+        
+    print(f"Input UMI BAM: {umi_bam}")
+    print(f"Input Internal BAM: {internal_bam}")
 
-    valid_chroms = get_bam_chromosomes(input_bam, samtools_exec)
+    # Check existence
+    if not os.path.exists(umi_bam) and not os.path.exists(internal_bam):
+         print("Error: Input BAMs not found.")
+         sys.exit(1)
+
+    # Use UMI bam for header check
+    header_bam = umi_bam if os.path.exists(umi_bam) else internal_bam
+    valid_chroms = get_bam_chromosomes(header_bam, samtools_exec)
+    
     saf_dir = os.path.join(out_dir, "zUMIs_output", "expression")
     if not os.path.exists(saf_dir): os.makedirs(saf_dir)
         
@@ -409,18 +425,15 @@ def main():
     
     bams_to_merge = []
     
-    if strand_opt == 1:
-        # Smart-seq3 Mode
-        internal_bam, umi_bam = split_bam_smartseq3(input_bam, num_threads, samtools_exec)
-        
-        # Internal
+    # Process Internal (Strand 0)
+    if os.path.exists(internal_bam):
         res_int_ex = run_featurecounts_cmd(internal_bam, exon_saf, internal_bam + ".ex", num_threads, 0, "Exon_Internal")
         current_int_bam = res_int_ex
         
         if count_introns:
              res_int_in = run_featurecounts_cmd(internal_bam, intron_saf, internal_bam + ".in", num_threads, 0, "Intron_Internal")
              merged_int = internal_bam + ".merged.bam"
-             merge_exon_intron_bams(res_int_ex, res_int_in, merged_int, samtools_exec, num_threads, gene_map)
+             merge_exon_intron_bams(res_int_ex, res_int_in, merged_int, samtools_exec, num_threads, gene_map, source_label="Internal")
              current_int_bam = merged_int
              # Cleanup intermediate Internal BAMs
              os.remove(res_int_ex)
@@ -428,52 +441,36 @@ def main():
              
         bams_to_merge.append(current_int_bam)
 
-        # UMI
+    # Process UMI (Strand 1)
+    if os.path.exists(umi_bam):
         res_umi_ex = run_featurecounts_cmd(umi_bam, exon_saf, umi_bam + ".ex", num_threads, 1, "Exon_UMI")
         current_umi_bam = res_umi_ex
         
         if count_introns:
             res_umi_in = run_featurecounts_cmd(umi_bam, intron_saf, umi_bam + ".in", num_threads, 1, "Intron_UMI")
             merged_umi = umi_bam + ".merged.bam"
-            merge_exon_intron_bams(res_umi_ex, res_umi_in, merged_umi, samtools_exec, num_threads, gene_map)
+            merge_exon_intron_bams(res_umi_ex, res_umi_in, merged_umi, samtools_exec, num_threads, gene_map, source_label="UMI")
             current_umi_bam = merged_umi
             # Cleanup intermediate UMI BAMs
             os.remove(res_umi_ex)
             os.remove(res_umi_in)
             
         bams_to_merge.append(current_umi_bam)
-        
-        # Cleanup Split BAMs
-        if os.path.exists(internal_bam): os.remove(internal_bam)
-        if os.path.exists(umi_bam): os.remove(umi_bam)
-        
-    else:
-        # Standard Mode
-        res_ex = run_featurecounts_cmd(input_bam, exon_saf, os.path.join(out_dir, "fc_temp_ex"), num_threads, strand_opt, "Exon")
-        current_bam = res_ex
-        
-        if count_introns:
-            res_in = run_featurecounts_cmd(input_bam, intron_saf, os.path.join(out_dir, "fc_temp_in"), num_threads, strand_opt, "Intron")
-            merged_bam = os.path.join(out_dir, "fc_merged.bam")
-            merge_exon_intron_bams(res_ex, res_in, merged_bam, samtools_exec, num_threads, gene_map)
-            current_bam = merged_bam
-            # Cleanup intermediate Standard BAMs
-            os.remove(res_ex)
-            os.remove(res_in)
-            
-        bams_to_merge.append(current_bam)
-    
+
     # Final Merge
     if len(bams_to_merge) == 1:
         print(f"Moving final BAM to {final_bam}")
         os.rename(bams_to_merge[0], final_bam)
-    else:
+    elif len(bams_to_merge) > 1:
         print(f"Merging BAMs to {final_bam}")
         cmd = [samtools_exec, 'cat', '-o', final_bam] + bams_to_merge
         subprocess.check_call(cmd)
         # Cleanup merged parts if they were temporary
         for b in bams_to_merge:
             if os.path.exists(b): os.remove(b)
+    else:
+        print("Error: No BAMs processed.")
+        sys.exit(1)
 
     print("FeatureCounts pipeline finished successfully.")
 

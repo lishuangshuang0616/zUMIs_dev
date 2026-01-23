@@ -45,10 +45,12 @@ def check_species(data):
 def make_dir(data):
     out_path=data['out_dir']
     if os.path.exists(out_path):
-        raise OSError('Out dirctory in yaml is exist, please delete it')
+        print(f"Warning: Output directory '{out_path}' already exists. Resuming/Overwriting analysis.")
+    else:
+        os.makedirs(out_path)
     
     for dirs in ['data','config','analysis','results']:
-        os.makedirs(f'{out_path}/{dirs}') 
+        os.makedirs(f'{out_path}/{dirs}', exist_ok=True) 
     
     # Create zUMIs output dirs here as well
     for dirs in ['zUMIs_output', 'zUMIs_output/expression/downsampling', 'zUMIs_output/stats', 'zUMIs_output/.tmpMerge']:
@@ -442,19 +444,28 @@ def run_pipeline_stages(yaml_file):
                 if os.path.exists(bc_bin_table):
                     print(">>> Correcting BC Tags")
                     correct_processes = []
+                    
+                    umi_chunks = []
+                    int_chunks = []
 
                     for suffix in chunk_suffixes:
                         raw_bam = os.path.join(tmp_merge_dir, f"{project}.{suffix}.raw.tagged.bam")
-                        fixed_bam = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.bam")
-
-                        if os.path.exists(fixed_bam):
-                            os.rename(fixed_bam, raw_bam)
-
-                        # New argument list: raw_bam, fixed_bam, bc_bin_table, samtools, expect_id_barcode
-                        # We removed the MGI specific bc_bin_raw_table passing to simplify logic.
-                        # Now all chemistries follow the same path: zUMIs correction -> WellID mapping -> Internal UMI clearing.
+                        # Fixed BAMs now split
+                        fixed_bam_umi = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.umi.bam")
+                        fixed_bam_int = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.internal.bam")
                         
-                        cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam, bc_bin_table, expect_id_barcode_file]
+                        umi_chunks.append(fixed_bam_umi)
+                        int_chunks.append(fixed_bam_int)
+
+                        if os.path.exists(fixed_bam_umi): os.remove(fixed_bam_umi) # Cleanup/Rename logic from before was weird, just process raw
+                        # Note: The previous logic renamed fixed->raw if fixed existed (rerun?).
+                        # Assuming raw exists or was renamed from fixed.
+                        # For safety, let's assume we proceed from raw.
+                        
+                        # Check if old single filtered exists and we are re-running? 
+                        # Ignore complex re-run logic for now, stick to standard flow.
+                        
+                        cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam_umi, fixed_bam_int, bc_bin_table, expect_id_barcode_file]
 
                         correct_processes.append(subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
 
@@ -462,32 +473,49 @@ def run_pipeline_stages(yaml_file):
                         _, stderr = p.communicate()
                         if p.returncode != 0:
                             raise RuntimeError(f"correct_BCtag failed (rc={p.returncode}): {stderr.strip()}")
+                            
+                    # Merge UMI Chunks
+                    print(">>> Merging UMI and Internal BAM chunks...")
+                    umi_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
+                    int_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
+                    
+                    # Using samtools cat
+                    subprocess.check_call([samtools, 'cat', '-o', umi_unmapped] + umi_chunks)
+                    subprocess.check_call([samtools, 'cat', '-o', int_unmapped] + int_chunks)
+                    
+                    # Cleanup chunks
+                    for f in umi_chunks + int_chunks:
+                         if os.path.exists(f): os.remove(f)
 
             if which_stage in ["Filtering", "Mapping"]:
                 print(">>> Starting Mapping Stage")
-                map_cmd = ['python3', f'{zumis_dir}/mapping_analysis.py', yaml_file]
+                # Updated to pass the two split BAMs
+                umi_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
+                int_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
+                
+                map_cmd = ['python3', f'{zumis_dir}/mapping_analysis.py', yaml_file, '--umi_bam', umi_unmapped, '--internal_bam', int_unmapped]
                 run_stage_cmd(map_cmd, "mapping_analysis.py")
 
             if which_stage in ["Filtering", "Mapping", "Counting"]:
                 print(">>> Starting Counting Stage")
                 # Replaced R script with Python implementation
-                # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-dge2.R", yaml_file], "FeatureCounts (R)", log_path)
-                featurecounts_cmd = ['python3', f'{zumis_dir}/run_featurecounts.py', yaml_file]
+                
+                # Updated to pass aligned BAMs (names determined by mapping_analysis output)
+                # Mapping analysis will produce:
+                umi_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.umi.Aligned.out.bam")
+                int_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.internal.Aligned.out.bam")
+                
+                featurecounts_cmd = ['python3', f'{zumis_dir}/run_featurecounts.py', yaml_file, '--umi_bam', umi_aligned, '--internal_bam', int_aligned]
                 run_stage_cmd(featurecounts_cmd, "FeatureCounts (Python)")
 
                 print(">>> Starting DGE Analysis (Python)")
                 dge_cmd = ['python3', f'{zumis_dir}/dge_analysis.py', yaml_file, samtools]
                 run_stage_cmd(dge_cmd, "dge_analysis.py")
 
-                if config.get('velocyto', 'no') == 'yes':
-                    # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/runVelocyto.R", yaml_file], "Velocyto", log_path)
-                    run_stage_cmd([rscript, f"{zumis_dir}/runVelocyto.R", yaml_file], "Velocyto")
-
             if which_stage in ["Filtering", "Mapping", "Counting", "Summarising"]:
                 # Force stats to run by default if not explicitly disabled
-                if config.get('make_stats', 'yes') == 'yes':
+                if str(config.get('make_stats', 'yes')).lower() in ['yes', 'true']:
                     print(">>> Starting Statistics Stage")
-                    # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-stats2.R", yaml_file], "Stats", log_path)
                     stats_cmd = ['python3', f'{zumis_dir}/generate_stats.py', yaml_file]
                     run_stage_cmd(stats_cmd, "Stats (Python)")
 

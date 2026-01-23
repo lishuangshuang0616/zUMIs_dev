@@ -28,7 +28,11 @@ featfile <- featfile_vector[which(file.exists(featfile_vector))[1]]
 print(Sys.time())
 #prepare the bam file for use with velocyto
 print("Preparing bam file for velocyto...")
-retag_cmd <- paste0(samtoolsexc," view -@ 2 -h ",featfile," | sed 's/BC:Z:/CB:Z:/' | sed 's/GE:Z:/GX:Z:/'")
+# The upstream BAM now has correct CB and GX tags.
+# We just copy it to the velocyto expected name, or view it.
+# retag_cmd <- paste0(samtoolsexc," view -@ 2 -h ",featfile," | sed 's/BC:Z:/CB:Z:/' | sed 's/GE:Z:/GX:Z:/'")
+# Simplified to just copying/viewing (preserving headers)
+retag_cmd <- paste0(samtoolsexc," view -@ 2 -h ",featfile)
 velobam <- paste0(opt$out_dir,"/",opt$project,".tagged.forVelocyto.bam")
 #sort_cmd <- paste0(samtoolsexc," sort -m ",mempercpu,"G -O BAM -@ ",opt$num_threads," -o ",velobam )
 out_cmd <- paste0(samtoolsexc," view -b -@ ",opt$num_threads," -o ",velobam," - " )

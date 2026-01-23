@@ -304,8 +304,8 @@ def assemble_reads(bamfile,gene_to_stitch, cell_set, isoform_dict_json,refskip_d
     bam = pysam.AlignmentFile(bamfile, 'rb')
     gene_of_interest = gene_to_stitch['gene_id']
     for read in bam.fetch(gene_to_stitch['seqid'], gene_to_stitch['start'], gene_to_stitch['end']):
-        if read.has_tag('CB'):
-            cell = read.get_tag('CB')
+        if read.has_tag(cell_tag):
+            cell = read.get_tag(cell_tag)
         else:
             continue
         if cell_set is not None:
@@ -317,10 +317,15 @@ def assemble_reads(bamfile,gene_to_stitch, cell_set, isoform_dict_json,refskip_d
         else:
             if read.has_tag('GE'):
                 gene_exon = read.get_tag('GE')
+            elif read.has_tag('GX') and read.has_tag('RE') and read.get_tag('RE') == 'E':
+                gene_exon = read.get_tag('GX')
             else:
                 gene_exon = 'Unassigned'
+            
             if read.has_tag('GI'):
                 gene_intron = read.get_tag('GI')
+            elif read.has_tag('GX') and read.has_tag('RE') and read.get_tag('RE') == 'N':
+                gene_intron = read.get_tag('GX')
             else:
                 gene_intron = 'Unassigned'
             # if it maps to the intron or exon of a gene
@@ -422,8 +427,8 @@ def convert_to_sam(stitched_m, UMI_tag):
     sam_dict['NR'] = 'NR:i:{}'.format(stitched_m['NR'])
     sam_dict['ER'] = 'ER:i:{}'.format(stitched_m['ER'])
     sam_dict['IR'] = 'IR:i:{}'.format(stitched_m['IR'])
-    sam_dict['BC'] = 'BC:Z:{}'.format(stitched_m['cell'])
-    sam_dict['XT'] = 'XT:Z:{}'.format(stitched_m['gene'])
+    sam_dict['CB'] = 'CB:Z:{}'.format(stitched_m['cell'])
+    sam_dict['GX'] = 'GX:Z:{}'.format(stitched_m['gene'])
     sam_dict[UMI_tag] = '{}:Z:{}'.format(UMI_tag, stitched_m['umi'])
     #sam_dict['EL'] = 'EL:B:I,{}'.format(','.join([str(e) for e in stitched_m['ends']]))
     if conflict:

@@ -54,38 +54,143 @@ def cluster_umis(umis, threshold=1):
             
     return parent_map
 
-def write_sparse_matrix(counts_dict, gene_names_map, out_dir, subdir_name):
+def natural_sort_key(s):
+    """
+    Key for natural sorting (e.g., A2 < A10).
+    Splits string into mixed list of strings and integers.
+    """
+    import re
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split('([0-9]+)', s)]
+
+def load_barcodes(out_dir, project):
+    """
+    Loads barcodes defining the matrix columns.
+    Priority 1: expect_id_barcode.tsv (Well IDs) - Ensures all wells are present & consistent.
+    Priority 2: kept_barcodes.txt (Detected Seqs) - Fallback for droplet/unstructured data.
+    """
+    # 1. Try Expect ID File (Config Dir)
+    # out_dir is usually ".../analysis"
+    # config is ".../config"
+    config_dir = os.path.join(os.path.dirname(out_dir.rstrip('/')), "config")
+    expect_file = os.path.join(config_dir, "expect_id_barcode.tsv")
+    
+    barcodes = []
+    source = ""
+    
+    if os.path.exists(expect_file):
+        print(f"Loading reference barcodes (Well IDs) from {expect_file}...")
+        source = "expect"
+        with open(expect_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                # Skip header if present (check commonly used header names)
+                if parts[0] in ['wellID', 'WellID', 'CellID', 'Barcode']:
+                    continue
+                if parts[0]:
+                    barcodes.append(parts[0])
+    else:
+        # 2. Fallback to Kept Barcodes (Analysis Dir)
+        kept_file = os.path.join(out_dir, "zUMIs_output", f"{project}kept_barcodes.txt")
+        print(f"Loading reference barcodes (Detected) from {kept_file}...")
+        source = "kept"
+        if os.path.exists(kept_file):
+            with open(kept_file, 'r') as f:
+                # Check header
+                first = f.readline()
+                if not ('XC' in first or 'n' in first):
+                    p = first.replace(',', '\t').split('\t')
+                    if p[0]: barcodes.append(p[0])
+                
+                for line in f:
+                    p = line.replace(',', '\t').split('\t')
+                    if p[0]: barcodes.append(p[0])
+        else:
+            print("Warning: No barcode file found. Matrix will be empty.")
+            return [], set()
+
+    # Remove duplicates just in case
+    barcodes = list(set(barcodes))
+    
+    # Sort
+    # Use natural sort for consistency (e.g. P1A2 before P1A10)
+    barcodes.sort(key=natural_sort_key)
+    
+    print(f"Loaded {len(barcodes)} barcodes from {source}.")
+    return barcodes, set(barcodes)
+
+def load_genes_from_gtf(gtf_file):
+    print(f"Loading reference genes from {gtf_file}...")
+    gene_order = []
+    gene_map = {}
+    seen_genes = set()
+    
+    with open(gtf_file, 'r') as f:
+        for line in f:
+            if line.startswith('#'): continue
+            parts = line.strip().split('\t')
+            if len(parts) < 9: continue
+            if parts[2] != 'exon': continue # Use exons to find gene entries
+            
+            attributes = parts[8]
+            gene_id = None
+            if 'gene_id "' in attributes:
+                gene_id = attributes.split('gene_id "')[1].split('"')[0]
+            elif 'gene_id' in attributes: # Fallback
+                try: gene_id = attributes.split('gene_id')[1].strip().split(';')[0].strip('"')
+                except: pass
+            
+            if not gene_id or gene_id in seen_genes: continue
+            
+            gene_name = gene_id
+            if 'gene_name "' in attributes:
+                gene_name = attributes.split('gene_name "')[1].split('"')[0]
+            
+            seen_genes.add(gene_id)
+            gene_order.append(gene_id)
+            gene_map[gene_id] = gene_name
+            
+    return gene_order, gene_map
+
+def write_sparse_matrix(counts_dict, gene_list, gene_names_map, barcode_list, out_dir, subdir_name):
     full_out_dir = os.path.join(out_dir, "zUMIs_output", "expression", subdir_name)
-    print(f"Generating sparse matrix in {full_out_dir}...")
+    print(f"Generating deterministic, sorted sparse matrix in {full_out_dir}...")
     
     if not os.path.exists(full_out_dir):
         os.makedirs(full_out_dir)
     
-    barcodes = sorted(counts_dict.keys())
-    genes_set = set()
-    for bc in counts_dict:
-        genes_set.update(counts_dict[bc].keys())
-    genes = sorted(list(genes_set))
+    # Use fixed lists for indices
+    gene_to_idx = {g: i for i, g in enumerate(gene_list)}
+    bc_to_idx = {b: i for i, b in enumerate(barcode_list)}
     
-    gene_to_idx = {g: i for i, g in enumerate(genes)}
-    bc_to_idx = {b: i for i, b in enumerate(barcodes)}
+    triplets = []
     
-    rows = []
-    cols = []
-    data = []
-    
+    # Collect data
     for bc, gene_counts in counts_dict.items():
+        if bc not in bc_to_idx: continue
         bc_idx = bc_to_idx[bc]
+        
         for gene, count in gene_counts.items():
-            if count > 0:
+            if count > 0 and gene in gene_to_idx:
                 gene_idx = gene_to_idx[gene]
-                rows.append(gene_idx)
-                cols.append(bc_idx)
-                data.append(count)
+                # Store as (bc_idx, gene_idx, count) for sorting
+                triplets.append((bc_idx, gene_idx, count))
                 
-    mat = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(len(genes), len(barcodes)))
+    # Sort: Primary = Barcode index (Col), Secondary = Gene index (Row)
+    # This produces the requested "Barcode then Feature" order in the file
+    triplets.sort(key=lambda x: (x[0], x[1]))
+    
+    # Re-extract for matrix creation
+    # Note: coo_matrix expects (data, (row_indices, col_indices))
+    rows = [t[1] for t in triplets]
+    cols = [t[0] for t in triplets]
+    data = [t[2] for t in triplets]
+                
+    # Shape is fixed to the full reference lists
+    mat = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(len(gene_list), len(barcode_list)))
     
     matrix_file = os.path.join(full_out_dir, "matrix.mtx")
+    # scipy mmwrite will respect the order of entries in the coo_matrix lists
     scipy.io.mmwrite(matrix_file, mat)
     with open(matrix_file, 'rb') as f_in:
         with gzip.open(matrix_file + ".gz", 'wb') as f_out:
@@ -93,11 +198,11 @@ def write_sparse_matrix(counts_dict, gene_names_map, out_dir, subdir_name):
     os.remove(matrix_file)
     
     with gzip.open(os.path.join(full_out_dir, "barcodes.tsv.gz"), "wt") as f:
-        for bc in barcodes:
+        for bc in barcode_list:
             f.write(f"{bc}\n")
             
     with gzip.open(os.path.join(full_out_dir, "features.tsv.gz"), "wt") as f:
-        for g_id in genes:
+        for g_id in gene_list:
             g_name = gene_names_map.get(g_id, g_id)
             f.write(f"{g_id}\t{g_name}\tGene Expression\n")
 
@@ -106,6 +211,20 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     out_dir = config['out_dir']
     ham_dist = int(config['counting_opts'].get('Ham_Dist', 0))
     count_introns = config.get('counting_opts', {}).get('introns', True)
+    
+    # Load Reference Lists
+    gtf_file = os.path.join(out_dir, f"{project}.final_annot.gtf")
+    
+    if not os.path.exists(gtf_file):
+        raise FileNotFoundError(f"GTF file not found: {gtf_file}")
+    
+    # Updated barcode loading logic
+    barcode_list, barcode_set = load_barcodes(out_dir, project)
+        
+    gene_list, gene_names_ref = load_genes_from_gtf(gtf_file)
+    gene_set = set(gene_list)
+    
+    print(f"Reference: {len(barcode_list)} Barcodes (Cols), {len(gene_list)} Genes (Rows)")
     
     print(f"Processing {bam_file}")
     
@@ -116,13 +235,11 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     }
     
     # Structure: read_counts_raw[category][barcode][gene] = int
-    # Counts raw reads BEFORE UMI collapsing
     read_counts_raw = {
         'exon': defaultdict(lambda: defaultdict(int)),
         'intron': defaultdict(lambda: defaultdict(int))
     }
     
-    gene_names_map = {} 
     correction_map = defaultdict(lambda: defaultdict(dict))
     
     print("Pass 1: Reading BAM to aggregate UMIs and Reads...")
@@ -130,21 +247,20 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
         for read in bam:
             if read.is_unmapped: continue
             try:
-                bc = read.get_tag("BC")
-                gene_id = read.get_tag("XT")
+                bc = read.get_tag("CB")
+                gene_id = read.get_tag("GX")
             except KeyError:
                 continue 
             
-            if read.has_tag("GN"):
-                gene_names_map[gene_id] = read.get_tag("GN")
-            elif gene_id not in gene_names_map:
-                gene_names_map[gene_id] = gene_id
+            # Filter strictly by Reference Lists
+            if bc not in barcode_set: continue
+            if gene_id not in gene_set: continue
             
             ftype = "exon"
-            if read.has_tag("XF"):
-                xf = read.get_tag("XF")
-                if xf == "Intron": ftype = "intron"
-                elif xf == "Exon": ftype = "exon"
+            if read.has_tag("RE"):
+                xf = read.get_tag("RE")
+                if xf == "N": ftype = "intron"
+                elif xf == "E": ftype = "exon"
                 else: continue
             
             if not count_introns and ftype == 'intron': continue
@@ -153,8 +269,8 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             read_counts_raw[ftype][bc][gene_id] += 1
             
             # Store UMI
-            if read.has_tag("UB"):
-                umi_data[ftype][bc][gene_id].append(read.get_tag("UB"))
+            if read.has_tag("UR"):
+                umi_data[ftype][bc][gene_id].append(read.get_tag("UR"))
 
     print("Pass 1 Complete. Calculating Statistics...")
 
@@ -171,17 +287,14 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
         'inex': defaultdict(lambda: defaultdict(int))
     }
 
-    # Calculate Inex Read Counts (Sum of Exon + Intron)
-    # Reads are mutually exclusive in BAM (a read is either Exon OR Intron), so simple sum works.
-    all_bcs_reads = set(read_counts_raw['exon'].keys()) | set(read_counts_raw['intron'].keys())
-    for bc in all_bcs_reads:
-        genes_exon = set(read_counts_raw['exon'].get(bc, {}).keys())
-        genes_intron = set(read_counts_raw['intron'].get(bc, {}).keys())
-        all_genes = genes_exon | genes_intron
-        for gene in all_genes:
-            c_ex = read_counts_raw['exon'].get(bc, {}).get(gene, 0)
-            c_in = read_counts_raw['intron'].get(bc, {}).get(gene, 0)
-            final_read_counts['inex'][bc][gene] = c_ex + c_in
+    # Calculate Inex Read Counts
+    for bc in read_counts_raw['exon']:
+        for gene in read_counts_raw['exon'][bc]:
+            final_read_counts['inex'][bc][gene] += read_counts_raw['exon'][bc][gene]
+            
+    for bc in read_counts_raw['intron']:
+        for gene in read_counts_raw['intron'][bc]:
+            final_read_counts['inex'][bc][gene] += read_counts_raw['intron'][bc][gene]
 
     # Calculate UMI Counts (with Clustering)
     all_bcs_umis = set(umi_data['exon'].keys()) | set(umi_data['intron'].keys())
@@ -219,16 +332,16 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     print("\nWriting Matrices...")
     
     # Write UMI Counts
-    write_sparse_matrix(final_umi_counts['exon'], gene_names_map, out_dir, f"{project}.exon.umi")
+    write_sparse_matrix(final_umi_counts['exon'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.exon.umi")
     if count_introns:
-        write_sparse_matrix(final_umi_counts['intron'], gene_names_map, out_dir, f"{project}.intron.umi")
-        write_sparse_matrix(final_umi_counts['inex'], gene_names_map, out_dir, f"{project}.inex.umi")
+        write_sparse_matrix(final_umi_counts['intron'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.intron.umi")
+        write_sparse_matrix(final_umi_counts['inex'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.inex.umi")
         
     # Write Read Counts
-    write_sparse_matrix(final_read_counts['exon'], gene_names_map, out_dir, f"{project}.exon.read")
+    write_sparse_matrix(final_read_counts['exon'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.exon.read")
     if count_introns:
-        write_sparse_matrix(final_read_counts['intron'], gene_names_map, out_dir, f"{project}.intron.read")
-        write_sparse_matrix(final_read_counts['inex'], gene_names_map, out_dir, f"{project}.inex.read")
+        write_sparse_matrix(final_read_counts['intron'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.intron.read")
+        write_sparse_matrix(final_read_counts['inex'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.inex.read")
     
     # --- PASS 2: BAM Correction ---
     print("Pass 2: Writing corrected BAM...")
@@ -237,26 +350,25 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     with pysam.AlignmentFile(bam_file, "rb", threads=threads) as infile:
         with pysam.AlignmentFile(tmp_bam_name, "wb", template=infile, threads=threads) as outfile:
             for read in infile:
-                # Process UMI tags if UB exists (Apply to ALL runs, Ham_Dist 0 or >0)
-                if read.has_tag("UB"):
-                    raw_umi = read.get_tag("UB")
-                    # Always set UX to raw UMI
-                    read.set_tag("UX", raw_umi)
+                # Process UMI tags if UR exists (Apply to ALL runs, Ham_Dist 0 or >0)
+                if read.has_tag("UR"):
+                    raw_umi = read.get_tag("UR")
                     
                     # Check if assigned to gene
-                    if read.has_tag("BC") and read.has_tag("XT"):
-                        bc = read.get_tag("BC")
-                        gene = read.get_tag("XT")
+                    if read.has_tag("CB") and read.has_tag("GX"):
+                        bc = read.get_tag("CB")
+                        gene = read.get_tag("GX")
                         
+                        final_umi = raw_umi
                         # Apply correction to UB if available (only relevant if Ham_Dist > 0)
                         if ham_dist > 0:
                             if bc in correction_map and gene in correction_map[bc]:
                                 if raw_umi in correction_map[bc][gene]:
-                                    corrected_umi = correction_map[bc][gene][raw_umi]
-                                    read.set_tag("UB", corrected_umi)
-                        # else: UB remains raw_umi (correct behavior for Ham_Dist=0)
+                                    final_umi = correction_map[bc][gene][raw_umi]
+                        
+                        read.set_tag("UB", final_umi)
                     else:
-                        # NOT assigned to gene: Remove UB tag
+                        # NOT assigned to gene: Remove UB tag if it exists (unlikely if UR is used as source)
                         read.set_tag("UB", None)
                 
                 outfile.write(read)
