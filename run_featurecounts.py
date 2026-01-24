@@ -173,8 +173,6 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
     print(f"Merging Exon and Intron BAMs into {out_bam} (Source: {source_label})...")
     
     sort_threads = max(1, int(threads) // 2)
-    # Sort by name (-n) and output SAM to stdout (-O sam)
-    # Increased buffer size for pipe
     buf_size = 64 * 1024 * 1024
     
     cmd_ex = [samtools_exec, 'sort', '-n', '-O', 'sam', '-@', str(sort_threads), '-o', '-', bam_ex]
@@ -183,40 +181,60 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
     proc_ex = subprocess.Popen(cmd_ex, stdout=subprocess.PIPE, text=True, bufsize=buf_size)
     proc_in = subprocess.Popen(cmd_in, stdout=subprocess.PIPE, text=True, bufsize=buf_size)
     
-    # Write to BAM (-b)
     cmd_out = [samtools_exec, 'view', '-b', '-o', out_bam, '-']
-    proc_out = subprocess.Popen(cmd_out, stdin=subprocess.PIPE, text=True, bufsize=buf_size)
+    # Ensure we capture stderr for diagnostics
+    proc_out = subprocess.Popen(cmd_out, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=buf_size)
     
-    header_lines = []
-    
-    # Process header
-    while True:
-        line = proc_ex.stdout.readline()
-        if not line: break
-        if line.startswith('@'):
-            proc_out.stdin.write(line)
-        else:
-            read_line_ex = line
-            break
-            
-    while True:
-        line = proc_in.stdout.readline()
-        if not line: break
-        if not line.startswith('@'):
-            read_line_in = line
-            break
-            
-    count = 0
+    read_line_ex = None
+    read_line_in = None
+
     try:
+        # Process header
+        while True:
+            line = proc_ex.stdout.readline()
+            if not line: break
+            if line.startswith('@'):
+                proc_out.stdin.write(line)
+            else:
+                read_line_ex = line
+                break
+                
+        while True:
+            line = proc_in.stdout.readline()
+            if not line: break
+            if not line.startswith('@'):
+                read_line_in = line
+                break
+                
+        count = 0
         while read_line_ex and read_line_in:
             count += 1
             if count % 1000000 == 0: print(f"Merged {count} reads...", end='\r')
             
-            # Fast sync check (Read ID is first column)
+            # Fast sync check using first column (Read ID)
             tab_ex = read_line_ex.find('\t')
+            tab_in = read_line_in.find('\t')
             
+            if tab_ex == -1 or tab_in == -1:
+                # Malformed line?
+                print(f"\nWarning: Malformed SAM line at read {count}")
+                read_line_ex = proc_ex.stdout.readline()
+                read_line_in = proc_in.stdout.readline()
+                continue
+
+            id_ex = read_line_ex[:tab_ex]
+            id_in = read_line_in[:tab_in]
+            
+            # Strict check for empty ID
+            if not id_ex:
+                raise ValueError(f"Empty Read ID in Exon BAM at line {count}. Raw line content: {repr(read_line_ex)}")
+            if not id_in:
+                raise ValueError(f"Empty Read ID in Intron BAM at line {count}. Raw line content: {repr(read_line_in)}")
+            
+            if id_ex != id_in:
+                raise ValueError(f"Read ID mismatch at index {count}: Exon='{id_ex}' vs Intron='{id_in}'. Sort order out of sync.")
+
             # Check assignments (XT tag)
-            # Optimization: check substring existence directly without full split
             has_xt_ex = 'XT:Z:' in read_line_ex
             
             final_line = None
@@ -231,61 +249,83 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
                     final_line = read_line_in.rstrip().replace('XT:Z:', 'GX:Z:') + "\tRE:Z:N"
                 else:
                     # Unassigned - Try to find detailed reason in XS tag
-                    # XS:Z:Unassigned_Ambiguity, etc.
                     reason = None
                     xs_pos = read_line_ex.find('XS:Z:')
                     if xs_pos != -1:
                         xs_end = read_line_ex.find('\t', xs_pos)
-                        reason = read_line_ex[xs_pos+5 : xs_end] if xs_end != -1 else read_line_ex[xs_pos+5:]
+                        # Fix: Ensure reason is stripped of newlines if it's the last tag
+                        reason = read_line_ex[xs_pos+5 : xs_end] if xs_end != -1 else read_line_ex[xs_pos+5:].rstrip()
                     
                     if reason and "Unassigned_" in reason:
-                        # Map to a clean status like "Ambiguity" or "MultiMapping"
                         status = reason.replace("Unassigned_", "")
-                        if status == "NoFeatures": status = "I"
-                        final_line = read_line_ex.rstrip() + f"\tRE:Z:{status}"
+                        if status == "NoFeatures":
+                            # NoFeatures -> Intergenic -> RE:Z:I
+                            final_line = read_line_ex.rstrip() + "\tRE:Z:I"
+                        else:
+                            # Ambiguity, MultiMapping, etc. -> No RE tag
+                            final_line = read_line_ex.rstrip()
                     else:
                         start_flag = tab_ex + 1
                         end_flag = read_line_ex.find('\t', start_flag)
-                        flag = int(read_line_ex[start_flag:end_flag])
-                        
-                        if not (flag & 0x4):
-                            final_line = read_line_ex.rstrip() + "\tRE:Z:I"
-                        else:
-                            final_line = read_line_ex.rstrip() + "\tRE:Z:Unmapped"
+                        try:
+                            flag = int(read_line_ex[start_flag:end_flag])
+                            if not (flag & 0x4):
+                                # Mapped but no assignment info -> Assume Intergenic
+                                final_line = read_line_ex.rstrip() + "\tRE:Z:I"
+                            else:
+                                # Unmapped -> No RE tag
+                                final_line = read_line_ex.rstrip()
+                        except ValueError:
+                             final_line = read_line_ex.rstrip()
             
-            # Add Source Tag
             if source_label:
                 final_line += f"\tSR:Z:{source_label}"
 
-            # Add GN tag if gene_map is provided and GX tag exists
             if gene_map and ('GX:Z:' in final_line):
-                # Extract Gene ID from GX tag
-                # Format GX:Z:GeneID
                 start_xt = final_line.find('GX:Z:') + 5
-                # Find end of GX tag (tab or end of line)
                 end_xt = final_line.find('\t', start_xt)
                 if end_xt == -1:
                     gene_id = final_line[start_xt:]
                 else:
                     gene_id = final_line[start_xt:end_xt]
                 
-                gene_name = gene_map.get(gene_id, gene_id) # Default to ID if Name not found
+                gene_name = gene_map.get(gene_id, gene_id)
                 final_line += f"\tGN:Z:{gene_name}"
             
+            # Final Safety Check before writing
+            if not final_line or final_line.startswith('\t'):
+                raise ValueError(f"CRITICAL: Attempting to write invalid SAM line at index {count}. Content: {repr(final_line)}")
+
             proc_out.stdin.write(final_line + "\n")
             
-            # Read next
             read_line_ex = proc_ex.stdout.readline()
             read_line_in = proc_in.stdout.readline()
-            
+
+    except BrokenPipeError:
+        print("\nError: Broken Pipe - The output BAM writer (samtools view) exited early.")
+        # Try to fetch error from stderr
+        outs, errs = proc_out.communicate()
+        if errs:
+            print(f"samtools view stderr:\n{errs}")
+        raise
+    except Exception as e:
+        print(f"\nError during merging: {e}")
+        raise
     finally:
-        proc_ex.stdout.close()
-        proc_in.stdout.close()
-        proc_out.stdin.close()
+        # Close all streams
+        if proc_ex.stdout: proc_ex.stdout.close()
+        if proc_in.stdout: proc_in.stdout.close()
+        if proc_out.stdin: proc_out.stdin.close()
+        
+        # Wait for processes
         proc_ex.wait()
         proc_in.wait()
         proc_out.wait()
-        print("\nMerge complete.")
+        
+        if proc_out.returncode and proc_out.returncode != 0:
+            print(f"samtools view exited with code {proc_out.returncode}")
+
+    print("\nMerge complete.")
 
 def split_bam_smartseq3(bam_file, threads, samtools_exec):
     print("Splitting BAM for Smart-seq3 processing (One-pass Optimized)...")

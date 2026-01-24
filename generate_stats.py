@@ -57,12 +57,35 @@ def load_gene_coords(gtf_file):
                 gene_coords[gene_id] = (start, end, strand)
     return gene_coords
 
+def cigar_ref_len(cigar):
+    """
+    Calculates the reference genome length corresponding to the CIGAR string, 
+    handling S and H operators.
+    """
+    if not cigar or cigar == '*':
+        return 0
+    num = 0
+    ref_len = 0
+    for ch in cigar:
+        o = ord(ch)
+        if 48 <= o <= 57:
+            num = num * 10 + (o - 48)  # Digit
+            continue
+        if ch in ('M', 'D', 'N', '=', 'X'):
+            ref_len += num  # Add to reference length
+        num = 0
+    return ref_len
+
 def load_exon_models(gtf_file):
+    """
+    Loads exon models, merges adjacent exons, and generates gene models.
+    Returns: dict {gene_id: {'chrom': str, 'strand': str, 'starts': list, 'ends': list, 'cum': list, 'total_len': int}}
+    """
     print(f"Loading exon models from {gtf_file}...")
     gene_exons = collections.defaultdict(list)
     gene_strand = {}
     gene_chrom = {}
-
+    
     if not os.path.exists(gtf_file):
         return {}
 
@@ -85,27 +108,25 @@ def load_exon_models(gtf_file):
             gene_id = None
             if 'gene_id "' in attributes:
                 gene_id = attributes.split('gene_id "')[1].split('"')[0]
-            if not gene_id:
-                continue
-
-            gene_exons[gene_id].append((start, end))
-            if gene_id not in gene_strand:
+            
+            if gene_id:
+                gene_exons[gene_id].append((start, end))
                 gene_strand[gene_id] = strand
-            if gene_id not in gene_chrom:
                 gene_chrom[gene_id] = chrom
-
+    
+    # Merge adjacent exons
     models = {}
     for gene_id, exons in gene_exons.items():
-        exons.sort()
+        exons.sort()  # Sort exons
         merged = []
         curr_s, curr_e = exons[0]
         for s, e in exons[1:]:
-            if s <= curr_e + 1:
+            if s <= curr_e + 1:  # Adjacent exons
                 curr_e = max(curr_e, e)
             else:
                 merged.append((curr_s, curr_e))
                 curr_s, curr_e = s, e
-        merged.append((curr_s, curr_e))
+        merged.append((curr_s, curr_e))  # Last exon
 
         starts = [s for s, _ in merged]
         ends = [e for _, e in merged]
@@ -113,7 +134,7 @@ def load_exon_models(gtf_file):
         total = 0
         for s, e in merged:
             cum.append(total)
-            total += (e - s + 1)
+            total += (e - s + 1)  # Cumulative length
 
         models[gene_id] = {
             "chrom": gene_chrom.get(gene_id),
@@ -186,33 +207,13 @@ def load_sparse_stats(matrix_dir):
                 
     return genes_per_cell, counts_per_gene
 
-def cigar_ref_len(cigar):
-    if not cigar or cigar == '*':
-        return 0
-    num = 0
-    ref_len = 0
-    for ch in cigar:
-        o = ord(ch)
-        if 48 <= o <= 57:
-            num = num * 10 + (o - 48)
-            continue
-        if ch in ('M', 'D', 'N', '=', 'X'):
-            ref_len += num
-        num = 0
-    return ref_len
-
 def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
     """
-    Iterates BAM and counts:
-    1. Read assignments (Exon, Intron, etc.) per cell.
-    2. Gene Body Coverage (UMI vs Internal).
+    Calculates Mapping Stats & Coverage from BAM file.
+    Returns: dict {Barcode: {Category: Count}} and coverage arrays.
     """
     print(f"Calculating Mapping Stats & Coverage from {bam_file}...")
-    
-    # Stats: {Barcode: {Category: Count}}
     stats = collections.defaultdict(lambda: collections.defaultdict(int))
-    
-    # Coverage Arrays (Percentiles 0-99)
     cov_umi = np.zeros(100, dtype=np.int64)
     cov_int = np.zeros(100, dtype=np.int64)
     
@@ -223,17 +224,20 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
     try:
         for line in proc.stdout:
             count += 1
-            if count % 1000000 == 0: print(f"Processed {count} reads...", end='\r')
-            
+            if count % 1000000 == 0:
+                print(f"Processed {count} reads...", end='\r')
+
             parts = line.strip().split('\t')
             if len(parts) < 12: continue
-            
+
             flag = int(parts[1])
-            if flag & 0x100 or flag & 0x800: continue
-            if flag & 0x1 and not (flag & 0x40):
-                continue
+            if flag & 0x100 or flag & 0x800: continue  # Exclude secondary/supplementary
             
-            # Extract Tags
+            # Count only Read 1 to avoid double counting fragments in PE data
+            if flag & 0x1: # Paired
+                if not (flag & 0x40): # If not Read 1, skip
+                    continue
+            
             tags = {}
             for t in parts[11:]:
                 if ':' not in t:
@@ -243,22 +247,14 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                     continue
                 tags[tag_parts[0]] = tag_parts[2]
             
-            # DEBUG: Print first 5 reads tags
-            if count <= 5:
-                print(f"DEBUG Read {count}: CB={tags.get('CB')} SR={tags.get('SR')} XS={tags.get('XS')} GX={tags.get('GX')} RE={tags.get('RE')}")
-
             bc = tags.get('CB')
             if not bc:
                 stats["__NO_CB__"]["Unused BC"] += 1
                 continue
-            bc = bc.strip() # Ensure matching
+            bc = bc.strip()
             
             # --- 1. Mapping Stats ---
-            
-            # Determine Category
             category = "Intergenic"
-            
-            # Source counting (SR tag)
             source = tags.get('SR')
             if bc in kept_barcodes:
                 if source == 'UMI':
@@ -266,7 +262,6 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                 elif source == 'Internal':
                     stats[bc]['Internal_Reads'] += 1
             
-            # Use RE tag if I added it
             if 'RE' in tags:
                 re_val = tags['RE']
                 if re_val == 'E':
@@ -275,40 +270,19 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                     category = 'Intron'
                 elif re_val == 'I':
                     category = 'Intergenic'
-                elif re_val == 'Unmapped':
-                    category = 'Unmapped'
                 else:
                     category = re_val
             else:
-                # Fallback Logic
-                if 'GX' in tags:
-                    category = "Exon"
-                elif 'XS' in tags:
+                if 'XS' in tags:
                     status = tags['XS']
                     if status.startswith("Unassigned_"):
                         status = status.replace("Unassigned_", "")
-                    
                     if status == "NoFeatures": category = "Intergenic"
                     else: category = status
                 else:
                     flag = int(parts[1])
                     if flag & 0x4: category = "Unmapped"
-
-            # Refine unassigned categories based on XS tag.
-            # Some BAMs may set RE:Z:I for multiple unassigned reasons; only NoFeatures is Intergenic.
-            if category == "Intergenic" and 'XS' in tags:
-                xs_val = tags['XS']
-                if xs_val.startswith("Unassigned_"):
-                    status = xs_val.replace("Unassigned_", "")
-                    if status == "NoFeatures":
-                        category = "Intergenic"
-                    elif status in ("Ambiguity", "Ambiguous"):
-                        category = "Ambiguity"
-                    elif status in ("MultiMapping", "Multimapping", "Multimapped"):
-                        category = "MultiMapping"
-                    else:
-                        category = status
-
+            
             stats[bc][category] += 1
             
             # --- 2. Coverage Calculation ---
@@ -354,7 +328,7 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                     cov_umi[bin_idx] += 1
                 else:
                     cov_int[bin_idx] += 1
-            
+
     finally:
         proc.stdout.close()
         proc.wait()
@@ -444,6 +418,9 @@ def plot_gene_umi_counts_by_type(stats_exon, stats_intron, stats_inex, wells, ou
     if not HAS_MATPLOTLIB:
         return
     types = ["Exon", "Intron+Exon", "Intron"]
+    # zUMIs colors
+    colors = ["#1A5084", "#914614", "#118730"]
+    
     gene_data = [
         [stats_exon.get(w, {}).get("genes", 0) for w in wells],
         [stats_inex.get(w, {}).get("genes", 0) for w in wells],
@@ -456,10 +433,22 @@ def plot_gene_umi_counts_by_type(stats_exon, stats_intron, stats_inex, wells, ou
     ]
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    axes[0].boxplot(gene_data, labels=types, notch=True)
+    
+    # Gene Counts Plot
+    bp0 = axes[0].boxplot(gene_data, labels=types, notch=True, patch_artist=True)
+    for patch, color in zip(bp0['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.8)
+        
     axes[0].set_title("Number of Genes")
     axes[0].set_ylabel("Count")
-    axes[1].boxplot(umi_data, labels=types, notch=True)
+    
+    # UMI Counts Plot
+    bp1 = axes[1].boxplot(umi_data, labels=types, notch=True, patch_artist=True)
+    for patch, color in zip(bp1['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.8)
+        
     axes[1].set_title("Number of UMIs")
     axes[1].set_ylabel("Count")
 
@@ -468,7 +457,7 @@ def plot_gene_umi_counts_by_type(stats_exon, stats_intron, stats_inex, wells, ou
             if not arr:
                 continue
             med = statistics.median(arr)
-            ax.text(i, med, f"{int(med)}", ha="center", va="bottom", color="orange")
+            ax.text(i, med, f"{int(med)}", ha="center", va="bottom", color="orange", fontweight='bold')
 
     plt.tight_layout()
     plt.savefig(out_pdf)

@@ -6,6 +6,8 @@ import numpy as np
 import os
 import sys
 import re
+import collections
+import multiprocessing as mp
 
 # Suppress pandas chained assignment warnings
 pd.options.mode.chained_assignment = None 
@@ -147,59 +149,142 @@ def cell_bc_selection(bccount_df, config):
     print(f"Selected {df['keep'].sum()} cell barcodes.")
     return df
 
-def fast_hamming_binning(true_bcs, candidate_bcs, threshold=1):
+_HB_TRUE_SET = None
+_HB_MASK_TO_TRUE = None
+_HB_BC_LEN = None
+
+def _hb_init(true_set, mask_to_true, bc_len):
+    global _HB_TRUE_SET, _HB_MASK_TO_TRUE, _HB_BC_LEN
+    _HB_TRUE_SET = true_set
+    _HB_MASK_TO_TRUE = mask_to_true
+    _HB_BC_LEN = bc_len
+
+def _hb_process_chunk(cand_chunk):
+    out = []
+    true_set = _HB_TRUE_SET
+    mask_to_true = _HB_MASK_TO_TRUE
+    bc_len = _HB_BC_LEN
+
+    for cand in cand_chunk:
+        if len(cand) != bc_len:
+            continue
+        if cand in true_set:
+            out.append({'falseBC': cand, 'trueBC': cand, 'hamming': 0})
+            continue
+        matches = set()
+        for i in range(bc_len):
+            mask = cand[:i] + '*' + cand[i+1:]
+            for t in mask_to_true.get(mask, ()):
+                matches.add(t)
+        if matches:
+            for t in matches:
+                out.append({'falseBC': cand, 'trueBC': t, 'hamming': 1})
+    return out
+
+def fast_hamming_binning(true_bcs, candidate_bcs, threshold=1, threads=1):
     """
     Optimized Hamming distance binning.
     Returns: (final_df, raw_df)
     - raw_df: All matches <= threshold (ties included)
     - final_df: Unambiguous matches only (ties discarded)
     """
-    # Try import for speed
-    try:
-        import Levenshtein
-        use_levenshtein = True
-    except ImportError:
-        print("Warning: python-Levenshtein not found. Using slower python fallback.")
-        use_levenshtein = False
+    true_list = [str(x).strip().upper() for x in true_bcs if pd.notna(x)]
+    cand_list = [str(x).strip().upper() for x in candidate_bcs if pd.notna(x)]
+
+    if not true_list or not cand_list:
+        return pd.DataFrame(), pd.DataFrame()
+
+    true_set = set(true_list)
+    bc_len = len(next(iter(true_set)))
+
+    if threshold < 0:
+        return pd.DataFrame(), pd.DataFrame()
 
     mapping_list = []
-    
-    true_bcs = np.array(true_bcs)
-    candidate_bcs = np.array(candidate_bcs)
-    
-    chunk_size = 5000 
-    total_chunks = (len(candidate_bcs) // chunk_size) + 1
-    
-    print(f"Starting binning: {len(true_bcs)} True BCs vs {len(candidate_bcs)} Candidate BCs")
-    
-    for i in range(0, len(candidate_bcs), chunk_size):
-        if i % (chunk_size * 5) == 0:
-            print(f"  Processing chunk {i // chunk_size + 1}/{total_chunks}...")
-            
-        cand_chunk = candidate_bcs[i : i + chunk_size]
-        
-        for cand in cand_chunk:
-            # Calculate distance to ALL true barcodes
-            if use_levenshtein:
-                dists = np.array([Levenshtein.hamming(cand, t) for t in true_bcs])
-            else:
-                # Fallback: char by char comparison
-                dists = np.array([sum(c1 != c2 for c1, c2 in zip(cand, t)) for t in true_bcs])
-            
-            min_dist = dists.min()
-            
-            if min_dist <= threshold:
-                # Store RAW matches (all ties)
-                best_matches_indices = np.where(dists == min_dist)[0]
-                
-                for match_idx in best_matches_indices:
-                     mapping_list.append({
-                        'falseBC': cand,
-                        'trueBC': true_bcs[match_idx],
-                        'hamming': min_dist
-                    })
 
-    raw_df = pd.DataFrame(mapping_list)
+    if threshold == 0:
+        for cand in cand_list:
+            if len(cand) != bc_len:
+                continue
+            if cand in true_set:
+                mapping_list.append({'falseBC': cand, 'trueBC': cand, 'hamming': 0})
+        raw_df = pd.DataFrame(mapping_list)
+    elif threshold == 1:
+        mask_to_true = collections.defaultdict(list)
+        for t in true_set:
+            if len(t) != bc_len:
+                continue
+            for i in range(bc_len):
+                mask_to_true[t[:i] + '*' + t[i+1:]].append(t)
+
+        threads = int(threads) if threads else 1
+        if threads > 1 and len(cand_list) >= 20000:
+            print(f"Starting binning: {len(true_set)} True BCs vs {len(cand_list)} Candidate BCs (threshold=1, threads={threads})")
+            try:
+                ctx = mp.get_context('fork')
+            except ValueError:
+                ctx = mp.get_context()
+
+            chunk_size = 5000
+            cand_chunks = [cand_list[i:i+chunk_size] for i in range(0, len(cand_list), chunk_size)]
+
+            with ctx.Pool(
+                processes=threads,
+                initializer=_hb_init,
+                initargs=(true_set, dict(mask_to_true), bc_len),
+            ) as pool:
+                for i, out in enumerate(pool.imap_unordered(_hb_process_chunk, cand_chunks), start=1):
+                    mapping_list.extend(out)
+                    if i % 10 == 0 or i == len(cand_chunks):
+                        print(f"  Processed chunks: {i}/{len(cand_chunks)}", end='\r')
+            print()
+        else:
+            print(f"Starting binning: {len(true_set)} True BCs vs {len(cand_list)} Candidate BCs (threshold=1)")
+            for cand in cand_list:
+                if len(cand) != bc_len:
+                    continue
+                if cand in true_set:
+                    mapping_list.append({'falseBC': cand, 'trueBC': cand, 'hamming': 0})
+                    continue
+                matches = set()
+                for i in range(bc_len):
+                    mask = cand[:i] + '*' + cand[i+1:]
+                    for t in mask_to_true.get(mask, ()):
+                        matches.add(t)
+                if matches:
+                    for t in matches:
+                        mapping_list.append({'falseBC': cand, 'trueBC': t, 'hamming': 1})
+        raw_df = pd.DataFrame(mapping_list)
+    else:
+        print(f"Warning: BarcodeBinning={threshold} may be slow. Consider using 0 or 1 for performance.")
+        true_arr = np.array(sorted(true_set), dtype=object)
+        chunk_size = 2000
+        total_chunks = (len(cand_list) // chunk_size) + 1
+        print(f"Starting binning: {len(true_arr)} True BCs vs {len(cand_list)} Candidate BCs (threshold={threshold})")
+        for i in range(0, len(cand_list), chunk_size):
+            if i % (chunk_size * 10) == 0:
+                print(f"  Processing chunk {i // chunk_size + 1}/{total_chunks}...")
+            for cand in cand_list[i:i+chunk_size]:
+                if len(cand) != bc_len:
+                    continue
+                best = threshold + 1
+                best_matches = []
+                for t in true_arr:
+                    dist = 0
+                    for c1, c2 in zip(cand, t):
+                        if c1 != c2:
+                            dist += 1
+                            if dist > best:
+                                break
+                    if dist < best:
+                        best = dist
+                        best_matches = [t]
+                    elif dist == best:
+                        best_matches.append(t)
+                if best <= threshold:
+                    for t in best_matches:
+                        mapping_list.append({'falseBC': cand, 'trueBC': t, 'hamming': best})
+        raw_df = pd.DataFrame(mapping_list)
     
     if raw_df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -278,7 +363,7 @@ def main():
         
         if len(candidates_bcs) > 0:
             threshold = bc_opts.get('BarcodeBinning', 1)
-            bin_map, bin_map_raw = fast_hamming_binning(true_bcs, candidates_bcs, threshold=threshold)
+            bin_map, bin_map_raw = fast_hamming_binning(true_bcs, candidates_bcs, threshold=threshold, threads=opt.get('num_threads', 1))
             
             if not bin_map.empty:
                 print(f"Binned {len(bin_map)} barcodes.")
