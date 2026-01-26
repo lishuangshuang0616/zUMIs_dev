@@ -20,91 +20,128 @@ def run_shell_cmd(cmd, step_name, log_file=None):
     if process.returncode != 0:
         raise Exception(f"Error in step [{step_name}]. Command failed: {cmd_str}")
 
-def split_fastq(fq_file, n_threads, n_reads, out_dir, project, pigz_exec="pigz"):
+def split_fastq(fq_files, n_threads, lines_per_chunk, out_dir, project, pigz_exec="pigz"):
     """
-    Splits a FastQ file into exactly n_threads chunks using Batch Round Robin.
-    This ensures perfectly balanced chunks without needing accurate read count estimation.
+    Splits FastQ files using GNU split (fast) with fallback to Python (slow).
+    Accepts a list of input files which are concatenated (streamed) before splitting.
+    
+    lines_per_chunk: Must be calculated externally to ensure R1/R2 synchronization.
     """
-    base_name = os.path.basename(fq_file)
+    # Ensure input is a list
+    if isinstance(fq_files, str):
+        fq_files = [fq_files]
+        
+    if not fq_files:
+        raise ValueError("No input files provided for splitting.")
+
+    # Base name from first file
+    base_name = os.path.basename(fq_files[0])
     if base_name.endswith('.gz'):
         base_name = base_name[:-3]
     
-    batch_size = 200000 # lines per batch (50,000 reads)
-    print(f"Splitting {fq_file} into {n_threads} balanced chunks (batch size: {batch_size} lines)...")
+    # Ensure lines_per_chunk is multiple of 4
+    rem = lines_per_chunk % 4
+    if rem != 0:
+        lines_per_chunk += (4 - rem)
+        
+    # Minimum chunk size
+    if lines_per_chunk < 4000: lines_per_chunk = 4000
     
-    # Open input stream
-    if fq_file.endswith('.gz'):
-        p_in = subprocess.Popen([pigz_exec, '-dc', fq_file], stdout=subprocess.PIPE, bufsize=1024*1024)
-        input_stream = p_in.stdout
-    else:
-        input_stream = open(fq_file, 'rb')
+    print(f"Splitting {len(fq_files)} files using GNU split (Target: {lines_per_chunk} lines/chunk)...")
+    
+    split_prefix = os.path.join(out_dir, f"{base_name}{project}")
+    
+    # Remove existing splits
+    existing = glob.glob(f"{split_prefix}??.gz")
+    for f in existing:
+        try: os.remove(f)
+        except: pass
 
-    # Initialize all output processes and file handles
-    out_procs = []
-    out_fhs = []
-    prefixes = []
-    buffers = [bytearray() for _ in range(n_threads)]
-    flush_threshold = 1024 * 1024 # 1MB internal buffer before pipe write
+    # Construct input file string
+    input_files_str = " ".join(shlex.quote(f) for f in fq_files)
+    
+    # Construct command
+    # pigz -dc file1 file2 ... | split ...
+    cmd = f"{pigz_exec} -dc {input_files_str} | split -l {lines_per_chunk} --filter='{pigz_exec} > $FILE.gz' - {shlex.quote(split_prefix)}"
     
     try:
-        for i in range(n_threads):
-            suffix = f"{chr(ord('a') + i // 26)}{chr(ord('a') + i % 26)}"
-            prefix_suffix = f"{project}{suffix}"
-            full_prefix = f"{base_name}{prefix_suffix}"
-            out_path = os.path.join(out_dir, f"{full_prefix}.gz")
-            
-            prefixes.append(prefix_suffix)
-            fh = open(out_path, 'wb')
-            # Use pigz for fast parallel compression
-            p = subprocess.Popen([pigz_exec, '-c'], stdin=subprocess.PIPE, stdout=fh, bufsize=1024*1024)
-            
-            out_fhs.append(fh)
-            out_procs.append(p)
-
-        current_chunk = 0
-        line_count = 0
+        subprocess.run(cmd, shell=True, check=True)
         
-        for line in input_stream:
-            buffers[current_chunk].extend(line)
-            line_count += 1
+        created_files = glob.glob(f"{split_prefix}??.gz")
+        suffixes = []
+        for f in sorted(created_files):
+            fname = os.path.basename(f)
+            prefix_len = len(base_name) + len(project)
+            suffix = fname[prefix_len:-3]
+            suffixes.append(suffix)
             
-            # Flush buffer to pipe if threshold reached
-            if len(buffers[current_chunk]) >= flush_threshold:
-                out_procs[current_chunk].stdin.write(buffers[current_chunk])
-                buffers[current_chunk].clear()
+        print(f"Successfully split into {len(suffixes)} chunks using GNU split.")
+        if not suffixes:
+             raise Exception("Split command ran but no files produced.")
+             
+        return [f"{project}{s}" for s in suffixes]
+
+    except Exception as e:
+        print(f"GNU split failed or not available ({e}). Falling back to Python implementation...")
+        
+        # Open input stream (concatenated)
+        # Using pigz -dc for multiple files works to concat them
+        p_in = subprocess.Popen(f"{pigz_exec} -dc {input_files_str}", shell=True, stdout=subprocess.PIPE, bufsize=1024*1024)
+        input_stream = p_in.stdout
+
+        # Initialize all output processes and file handles
+        out_procs = []
+        out_fhs = []
+        prefixes = []
+        buffers = [bytearray() for _ in range(n_threads)]
+        flush_threshold = 1024 * 1024 
+        
+        batch_size = 200000 
+        
+        try:
+            for i in range(n_threads):
+                suffix = f"{chr(ord('a') + i // 26)}{chr(ord('a') + i % 26)}"
+                prefix_suffix = f"{project}{suffix}"
+                full_prefix = f"{base_name}{prefix_suffix}"
+                out_path = os.path.join(out_dir, f"{full_prefix}.gz")
+                
+                prefixes.append(prefix_suffix) 
+                
+                fh = open(out_path, 'wb')
+                p = subprocess.Popen([pigz_exec, '-c'], stdin=subprocess.PIPE, stdout=fh, bufsize=1024*1024)
+                out_fhs.append(fh)
+                out_procs.append(p)
+
+            current_chunk = 0
+            line_count = 0
             
-            # Switch chunk after reaching batch size (must be multiple of 4 lines)
-            if line_count >= batch_size:
-                # Flush remaining buffer for current chunk before switching
-                if buffers[current_chunk]:
+            for line in input_stream:
+                buffers[current_chunk].extend(line)
+                line_count += 1
+                
+                if len(buffers[current_chunk]) >= flush_threshold:
                     out_procs[current_chunk].stdin.write(buffers[current_chunk])
                     buffers[current_chunk].clear()
                 
-                current_chunk = (current_chunk + 1) % n_threads
-                line_count = 0
+                if line_count >= batch_size:
+                    if buffers[current_chunk]:
+                        out_procs[current_chunk].stdin.write(buffers[current_chunk])
+                        buffers[current_chunk].clear()
+                    current_chunk = (current_chunk + 1) % n_threads
+                    line_count = 0
 
-    finally:
-        # Final flush and close all processes
-        for i in range(n_threads):
-            if buffers[i]:
-                try: out_procs[i].stdin.write(buffers[i])
-                except: pass
-            
-            if out_procs[i].stdin:
-                out_procs[i].stdin.close()
-            
-        for p in out_procs:
-            p.wait()
-            
-        for fh in out_fhs:
-            fh.close()
-            
-        if fq_file.endswith('.gz'):
+        finally:
+            for i in range(n_threads):
+                if buffers[i]:
+                    try: out_procs[i].stdin.write(buffers[i])
+                    except: pass
+                if out_procs[i].stdin:
+                    out_procs[i].stdin.close()
+            for p in out_procs: p.wait()
+            for fh in out_fhs: fh.close()
             p_in.wait()
-        else:
-            input_stream.close()
 
-    return prefixes
+        return prefixes
 
 
 def merge_bam_stats(tmp_dir, project, out_dir, yaml_file, samtools_exec):

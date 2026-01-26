@@ -255,9 +255,10 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
     cov_umi = np.zeros(100, dtype=np.int64)
     cov_int = np.zeros(100, dtype=np.int64)
     
-    # Downsampling threshold for coverage plot
-    MAX_COV_READS = 1000000
-    cov_reads_processed = 0
+    # Downsampling threshold for coverage plot (per category)
+    MAX_COV_READS = 500000
+    cov_count_umi = 0
+    cov_count_int = 0
     
     save = pysam.set_verbosity(0) # Suppress warnings
     with pysam.AlignmentFile(bam_file, "rb", threads=4) as bam:
@@ -319,83 +320,49 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                 if is_read1:
                     stats["__NO_CB__"]["Unused BC"] += 1
             
-            # --- 2. Coverage Calculation (Downsampled) ---
-            # Only process if we haven't hit the limit
-            if cov_reads_processed < MAX_COV_READS:
-                if is_kept and 'GX' in tags and source in ['UMI', 'Internal']:
+            # --- 2. Coverage Calculation (Downsampled independently) ---
+            if is_kept and 'GX' in tags and source in ['UMI', 'Internal']:
+                # Determine if we should process this read based on its type count
+                process_coverage = False
+                if source == 'UMI':
+                    if cov_count_umi < MAX_COV_READS:
+                        process_coverage = True
+                else: # Internal
+                    if cov_count_int < MAX_COV_READS:
+                        process_coverage = True
+                
+                if process_coverage:
                     gene_id = tags['GX']
                     model = gene_models.get(gene_id)
                     
                     if model:
-                        # pysam get_blocks() returns list of (start, end) tuples
-                        # These are 0-based, half-open intervals [start, end)
                         blocks = read.get_blocks()
-                        if not blocks: continue
-                        
-                        pct_points = model["percentiles"]
-                        strand_minus = (model["strand"] == '-')
-                        
-                        # Process blocks
-                        for b_start, b_end in blocks:
-                            # Convert 0-based pysam to coordinates matching 1-based percentiles logic if needed?
-                            # Actually percentiles are genomic coords. 
-                            # RSeQC logic uses genomic coords.
-                            # b_start, b_end are genomic coords.
+                        if blocks:
+                            pct_points = model["percentiles"]
+                            strand_minus = (model["strand"] == '-')
                             
-                            # Use bisect to find range of percentile points covered by this block
-                            idx_start = bisect.bisect_left(pct_points, b_start)
-                            idx_end = bisect.bisect_right(pct_points, b_end - 1) # -1 because end is exclusive
+                            for b_start, b_end in blocks:
+                                idx_start = bisect.bisect_left(pct_points, b_start)
+                                idx_end = bisect.bisect_right(pct_points, b_end - 1)
+                                
+                                if idx_end > idx_start:
+                                    indices = range(idx_start, idx_end)
+                                    if strand_minus:
+                                        for i in indices:
+                                            bin_idx = 99 - i
+                                            if source == 'UMI': cov_umi[bin_idx] += 1
+                                            else: cov_int[bin_idx] += 1
+                                    else:
+                                        for i in indices:
+                                            bin_idx = i
+                                            if source == 'UMI': cov_umi[bin_idx] += 1
+                                            else: cov_int[bin_idx] += 1
                             
-                            # If the block covers any percentile points
-                            if idx_end > idx_start:
-                                count_range = idx_end - idx_start
-                                # Which bins to increment?
-                                # The indices in pct_points correspond to 0..99 bins
-                                
-                                indices = range(idx_start, idx_end)
-                                
-                                if strand_minus:
-                                    # For negative strand, index 0 in pct_points is the 3' end (high coord)
-                                    # Wait, load_gene_percentiles sorts points:
-                                    #   gene_all_base.sort()
-                                    #   if strand == '-': gene_all_base.reverse()
-                                    #   ... points are picked ...
-                                    #   models[...]["percentiles"] = sorted(points)
-                                    
-                                    # So "percentiles" list is ALWAYS sorted Low -> High.
-                                    # But for Negative strand, the Low coord (index 0 of sorted list) is actually the 100th percentile (3' end).
-                                    # No, let's re-read load_gene_percentiles logic:
-                                    #   idx = int(math.ceil(size * i / 100.0)) - 1
-                                    #   points.append(gene_all_base[idx])
-                                    #   models[...]["percentiles"] = sorted(points)
-                                    
-                                    # If strand is '-', gene_all_base was reversed (High -> Low).
-                                    # So i=1 (1st percentile, 5' end) picks from High coords.
-                                    # i=100 (100th percentile, 3' end) picks from Low coords.
-                                    # But then we perform `sorted(points)`.
-                                    # So pct_points[0] is the Lowest Coordinate.
-                                    # For '-', Lowest Coordinate corresponds to the 100th percentile (3' end).
-                                    # For '+', Lowest Coordinate corresponds to the 1st percentile (5' end).
-                                    
-                                    # So:
-                                    # Strand +: pct_points[i] corresponds to bin i
-                                    # Strand -: pct_points[i] corresponds to bin (99 - i)
-                                    
-                                    # Update arrays
-                                    # We can't do slice increment easily on numpy with iterator, loop is fine for 100 items max
-                                    for i in indices:
-                                        bin_idx = 99 - i
-                                        if source == 'UMI': cov_umi[bin_idx] += 1
-                                        else: cov_int[bin_idx] += 1
-                                else:
-                                    for i in indices:
-                                        bin_idx = i
-                                        if source == 'UMI': cov_umi[bin_idx] += 1
-                                        else: cov_int[bin_idx] += 1
+                            # Increment counters
+                            if source == 'UMI': cov_count_umi += 1
+                            else: cov_count_int += 1
 
-                        cov_reads_processed += 1
-
-    print(f"\nFinished parsing {count} reads. (Used {cov_reads_processed} for coverage plots)")
+    print(f"\nFinished parsing {count} reads. (Cov UMI: {cov_count_umi}, Cov Int: {cov_count_int})")
     return stats, cov_umi, cov_int
 
 def plot_coverage(cov_umi, cov_int, out_prefix):

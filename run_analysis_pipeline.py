@@ -4,7 +4,7 @@
 import os
 import argparse
 import yaml
-import re, copy
+import copy
 import sys
 import subprocess
 import shutil
@@ -12,7 +12,7 @@ import pipeline_modules
 from datetime import datetime
 import multiprocessing
 import gzip
-import struct
+import math
 
 def load_yaml(yaml_file):
     if not os.path.exists(yaml_file):
@@ -174,47 +174,66 @@ def create_barcode(data):
     
     
 def check_file_exists(data):
-    files_to_check=[data['sequence_files']['file1']['name'],
-                   data['sequence_files']['file2']['name'],
-                   data['reference']['STAR_index'],
-                   data['reference']['GTF_file']]
-    for filepath in files_to_check:
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f'{filepath} not exist, please check!')
+    files_to_check=[data['reference']['STAR_index'], data['reference']['GTF_file']]
+    
+    # Check sequence files (comma separated)
+    def check_seq_entry(entry):
+        if not entry: return
+        for f in entry.split(','):
+            if not os.path.exists(f.strip()):
+                raise FileNotFoundError(f'{f} not exist, please check!')
+
+    check_seq_entry(data['sequence_files']['file1']['name'])
+    check_seq_entry(data['sequence_files']['file2']['name'])
            
 
 def process_fq(data):
     sample_type = data['sample']['sample_type'].lower()
-    fq1 = data['sequence_files']['file1']['name']
-    fq1_name = os.path.basename(fq1)
-    fq2 = data['sequence_files']['file2']['name']
-    fq2_name = os.path.basename(fq2) 
-    out_path=data['out_dir']
-
-    def ensure_symlink(src, dst):
-        if os.path.lexists(dst):
-            try:
-                if os.path.islink(dst) and os.readlink(dst) == src:
-                    return
-            except OSError:
-                pass
-            os.remove(dst)
-        os.symlink(src, dst)
-
-    ensure_symlink(fq1, f'{out_path}/data/{fq1_name}')
-    ensure_symlink(fq2, f'{out_path}/data/{fq2_name}')
+    out_path = data['out_dir']
     
-    # Unified logic: always symlink, no preprocessing with transfer_barcode
-    out_fq2_name = fq2_name
+    def handle_file_entry(entry_name):
+        if not entry_name: return ""
+        # Handle comma-separated list
+        src_files = [f.strip() for f in entry_name.split(',')]
+        dest_names = []
+        
+        for src in src_files:
+            base = os.path.basename(src)
+            dest = f'{out_path}/data/{base}'
+            
+            if os.path.lexists(dest):
+                try:
+                    if os.path.islink(dest) and os.readlink(dest) == src:
+                        pass
+                    else:
+                        os.remove(dest)
+                        os.symlink(src, dest)
+                except OSError:
+                    pass # Race condition or permission
+            else:
+                os.symlink(src, dest)
+            dest_names.append(base)
+            
+        return ",".join(dest_names)
 
-    return fq1_name, out_fq2_name
+    fq1_in = data['sequence_files']['file1']['name']
+    fq2_in = data['sequence_files']['file2']['name']
+    
+    fq1_out = handle_file_entry(fq1_in)
+    fq2_out = handle_file_entry(fq2_in)
+
+    return fq1_out, fq2_out
 
 
 def modify_yaml(data, fq1_names, fq2_names):
     out_path=data['out_dir']
     
-    data['sequence_files']['file1']['name'] = f'{out_path}/data/{fq1_names}'
-    data['sequence_files']['file2']['name'] = f'{out_path}/data/{fq2_names}'
+    # fq1_names is comma-separated basenames. Prepend path.
+    def prepend_path(names):
+        return ",".join([f'{out_path}/data/{n}' for n in names.split(',')])
+        
+    data['sequence_files']['file1']['name'] = prepend_path(fq1_names)
+    data['sequence_files']['file2']['name'] = prepend_path(fq2_names)
 
     # Unified barcode file
     data['barcodes']['barcode_file'] = f'{out_path}/config/expect_barcode.tsv'
@@ -250,7 +269,7 @@ def modify_yaml(data, fq1_names, fq2_names):
     yaml.add_representer(bool, bool_representer, Dumper=ZumisDumper)
     yaml.add_representer(type(None), none_representer, Dumper=ZumisDumper)
 
-    # Ensure downsampling is a string, even if parsed as list or number
+    # Ensure downsampling is a string
     ds_val = new_data['counting_opts'].get('downsampling', '0')
     if isinstance(ds_val, list):
         ds_val = ",".join(map(str, ds_val))
@@ -297,11 +316,6 @@ def run_pipeline_stages(yaml_file):
             for stream in self._streams:
                 stream.flush()
 
-    def gzip_uncompressed_size(path):
-        with open(path, 'rb') as f:
-            f.seek(-4, os.SEEK_END)
-            return struct.unpack('<I', f.read(4))[0]
-
     def estimate_avg_line_len(path, sample_lines=1000):
         opener = gzip.open if path.endswith('.gz') else open
         total = 0
@@ -314,19 +328,6 @@ def run_pipeline_stages(yaml_file):
                 total += len(line)
                 n += 1
         return (total / n) if n else 0.0
-
-    def sorted_sequence_file_entries(sequence_files):
-        if isinstance(sequence_files, dict):
-            def key_fn(k):
-                m = re.search(r'(\d+)', str(k))
-                return int(m.group(1)) if m else str(k)
-
-            for k in sorted(sequence_files.keys(), key=key_fn):
-                yield sequence_files[k]
-            return
-        if isinstance(sequence_files, list):
-            for entry in sequence_files:
-                yield entry
 
     log_path = os.path.join(out_dir, 'zUMIs_run.log')
     tmp_merge_dir = os.path.join(out_dir, 'zUMIs_output', '.tmpMerge')
@@ -344,9 +345,6 @@ def run_pipeline_stages(yaml_file):
                     cmd_str = " ".join(cmd)
                 else:
                     cmd_str = str(cmd)
-                
-                # print(f">>> Running {stage_name}: {cmd_str}") # Already printed by stage headers mostly
-                
                 res = subprocess.run(cmd, stdout=run_log, stderr=subprocess.STDOUT, shell=shell)
                 if res.returncode != 0:
                     run_log.flush()
@@ -360,65 +358,75 @@ def run_pipeline_stages(yaml_file):
 
             if which_stage == "Filtering":
                 print(">>> Starting Filtering Stage")
-                # ... (Filtering code remains mostly same, but fqfilter is manual Popen) ...
                 
-                file_paths = []
-                for entry in sorted_sequence_file_entries(config.get('sequence_files', {})):
-                    if isinstance(entry, dict) and entry.get('name'):
-                        file_paths.append(entry['name'])
+                # Get File Lists (Handle comma-separated)
+                f1_str = config.get('sequence_files', {}).get('file1', {}).get('name', '')
+                f2_str = config.get('sequence_files', {}).get('file2', {}).get('name', '')
+                
+                fq1_files = [f.strip() for f in f1_str.split(',')] if f1_str else []
+                fq2_files = [f.strip() for f in f2_str.split(',')] if f2_str else []
 
-                if not file_paths:
-                    raise ValueError("No sequence file paths found in YAML configuration.")
+                if not fq1_files:
+                    raise ValueError("No file1 found in YAML configuration.")
 
-                first_fq = file_paths[0]
-                print(f"Estimating read count from {first_fq}...")
+                total_size_bytes = 0
+                first_fq = fq1_files[0]
+                
+                for f in fq1_files:
+                    if f.endswith('.gz'):
+                        # Estimate uncompressed size (approx 3x compressed) for fast calculation
+                        total_size_bytes += os.path.getsize(f) * 3
+                    else:
+                        total_size_bytes += os.path.getsize(f)
 
-                if first_fq.endswith('.gz'):
-                    file_size = gzip_uncompressed_size(first_fq) or os.path.getsize(first_fq)
-                else:
-                    file_size = os.path.getsize(first_fq)
-
+                # Estimate avg line len from first file
                 avg_line_len = estimate_avg_line_len(first_fq, sample_lines=1000)
                 if avg_line_len <= 0:
                     raise ValueError(f"Failed to estimate average line length for {first_fq}")
 
-                total_lines_est = file_size / avg_line_len
-                total_reads_est = max(1, total_lines_est / 4)
-                print(f"Estimated reads: {int(total_reads_est)}")
+                total_lines_est = total_size_bytes / avg_line_len
+                
+                # Calculate strict lines_per_chunk for R1/R2 sync
+                lines_per_chunk = int(math.ceil(total_lines_est / num_threads))
+                # Multiple of 4
+                rem = lines_per_chunk % 4
+                if rem != 0: lines_per_chunk += (4 - rem)
+                if lines_per_chunk < 4000: lines_per_chunk = 4000
+                
+                print(f"Total input estimation: {int(total_lines_est/4)} reads.")
+                print(f"Split config: {lines_per_chunk} lines per chunk.")
 
-                pool = multiprocessing.Pool(processes=min(len(file_paths), num_threads))
+                pool = multiprocessing.Pool(processes=min(2, num_threads)) 
                 results = []
-                for fq in file_paths:
-                    res = pool.apply_async(
+                
+                # R1
+                res1 = pool.apply_async(
+                    pipeline_modules.split_fastq,
+                    (fq1_files, num_threads, lines_per_chunk, tmp_merge_dir, project, pigz),
+                )
+                results.append(res1)
+                
+                # R2
+                if fq2_files:
+                    res2 = pool.apply_async(
                         pipeline_modules.split_fastq,
-                        (fq, num_threads, total_reads_est, tmp_merge_dir, project, pigz),
+                        (fq2_files, num_threads, lines_per_chunk, tmp_merge_dir, project, pigz),
                     )
-                    results.append(res)
+                    results.append(res2)
 
                 pool.close()
                 pool.join()
 
-                chunk_suffixes = results[0].get()
+                chunk_suffixes = results[0].get() 
 
                 print(">>> Running fqfilter.py on chunks")
-                
-                # Check for max_reads limit in config
                 max_reads = config.get('counting_opts', {}).get('max_reads', 0)
-                if not max_reads:
-                    max_reads = config.get('max_reads', 0) # Support top-level as well
                 
                 processes = []
                 for suffix in chunk_suffixes:
                     cmd = ['python3', f'{zumis_dir}/fqfilter.py', yaml_file, samtools, rscript, pigz, zumis_dir, suffix]
                     
                     if max_reads and int(max_reads) > 0:
-                        # If we have multiple chunks, we should probably divide the limit?
-                        # Or just apply the limit to each chunk?
-                        # If we split the file, each chunk has a fraction of reads.
-                        # If we apply total limit to EACH chunk, we get N * limit total.
-                        # But since we use round-robin, reads are distributed evenly.
-                        # So if we want TOTAL 100k reads, and we have 10 chunks, we should limit each to 10k.
-                        
                         chunk_limit = int(int(max_reads) / len(chunk_suffixes))
                         if chunk_limit < 1: chunk_limit = 1
                         cmd.extend(['--limit', str(chunk_limit)])
@@ -434,34 +442,41 @@ def run_pipeline_stages(yaml_file):
                 pipeline_modules.merge_bam_stats(tmp_merge_dir, project, out_dir, yaml_file, samtools)
 
                 print(">>> Running Barcode Detection")
-                # pipeline_modules.run_shell_cmd([rscript, f"{zumis_dir}/zUMIs-BCdetection.R", yaml_file], "BCdetection", log_path)
-                # Updated to use the faster Python implementation for BC detection
                 run_stage_cmd(["python3", f"{zumis_dir}/zUMIs_BCdetection.py", yaml_file], "BCdetection")
 
                 bc_bin_table = os.path.join(out_dir, 'zUMIs_output', f"{project}.BCbinning.txt")
                 expect_id_barcode_file = os.path.join(out_dir, '../config', 'expect_id_barcode.tsv')
                 
                 if os.path.exists(bc_bin_table):
-                    print(">>> Preparing chunks for Stream Correction (Skipping physical write)...")
+                    print(">>> Correcting BC Tags")
+                    correct_processes = []
                     
                     umi_chunks = []
                     int_chunks = []
 
                     for suffix in chunk_suffixes:
                         raw_bam = os.path.join(tmp_merge_dir, f"{project}.{suffix}.raw.tagged.bam")
+                        # Output files
+                        fixed_bam_umi = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.umi.bam")
+                        fixed_bam_int = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.internal.bam")
                         
-                        # Both UMI and Internal analysis will read the SAME raw BAM
-                        # The filtering happens inside stream_corrector.py via --type argument
-                        if os.path.exists(raw_bam):
-                            umi_chunks.append(raw_bam)
-                            int_chunks.append(raw_bam)
+                        umi_chunks.append(fixed_bam_umi)
+                        int_chunks.append(fixed_bam_int)
+
+                        # If fixed exists, remove it to ensure clean run
+                        if os.path.exists(fixed_bam_umi): os.remove(fixed_bam_umi) 
+                        if os.path.exists(fixed_bam_int): os.remove(fixed_bam_int)
+                        
+                        cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam_umi, fixed_bam_int, bc_bin_table, expect_id_barcode_file]
+
+                        correct_processes.append(subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+
+                    for p in correct_processes:
+                        _, stderr = p.communicate()
+                        if p.returncode != 0:
+                            raise RuntimeError(f"correct_BCtag failed (rc={p.returncode}): {stderr.strip()}")
                             
-                    print(f"Prepared {len(umi_chunks)} chunks for streaming.")
-                    
-                    # Merge UMI Chunks logic REMOVED to save IO
                     print(">>> Skipping physical merge of chunks (will stream to STAR)...")
-                    
-                    # We keep umi_chunks and int_chunks variables for the Mapping stage
                     
             if which_stage in ["Filtering", "Mapping"]:
                 print(">>> Starting Mapping Stage")
@@ -478,9 +493,7 @@ def run_pipeline_stages(yaml_file):
                     if os.path.exists(legacy_umi):
                         umi_arg = legacy_umi
                     else:
-                        # Fallback: check for existing chunks on disk if restarting from Mapping?
-                        # This is tricky without metadata. Let's assume legacy merged for restarts.
-                        pass
+                        pass # Rely on Mapping script handling (or fail there)
 
                 if 'int_chunks' in locals() and int_chunks:
                     int_arg = ",".join(int_chunks)
@@ -505,10 +518,8 @@ def run_pipeline_stages(yaml_file):
 
             if which_stage in ["Filtering", "Mapping", "Counting"]:
                 print(">>> Starting Counting Stage")
-                # Replaced R script with Python implementation
                 
                 # Updated to pass aligned BAMs (names determined by mapping_analysis output)
-                # Mapping analysis will produce:
                 umi_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.umi.Aligned.out.bam")
                 int_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.internal.Aligned.out.bam")
                 
