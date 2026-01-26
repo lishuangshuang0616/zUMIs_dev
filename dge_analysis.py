@@ -22,36 +22,79 @@ def load_config(yaml_file):
     with open(yaml_file, 'r') as f:
         return yaml.safe_load(f)
 
-def hamming_distance(s1, s2):
-    if len(s1) != len(s2): return len(s1)
-    return sum(c1 != c2 for c1, c2 in zip(s1, s2))
-
 def cluster_umis(umis, threshold=1):
+    """
+    Optimized UMI clustering using hash-based neighbor search.
+    Complexity: O(N * L) instead of O(N^2).
+    """
     if not umis: return {}
-    if threshold == 0:
-        return {u: u for u in umis}
-
+    
+    # 1. Frequency counting
     counts = Counter(umis)
+    
+    # 2. Sort unique UMIs: descending count, then lexicographical
+    # This ensures we always map lower-count/variant UMIs to higher-count/canonical ones
     unique_umis = sorted(counts.keys(), key=lambda x: (-counts[x], x))
     
-    parent_map = {} 
-    visited = set()
+    parent_map = {u: u for u in unique_umis}
     
+    # Optimization: If threshold is 0, no clustering needed
+    if threshold == 0:
+        return parent_map
+        
+    # Set for fast lookup of valid UMIs
+    umi_set = set(unique_umis)
+    
+    # We only mark children as 'visited' so they don't become parents
+    # But in the sorted loop, once a child is merged, we can skip processing it as a parent?
+    # Yes. 'visited' tracks UMIs that have been assigned to a parent.
+    visited = set()
+
+    bases = {'A', 'C', 'G', 'T', 'N'}
+
     for parent in unique_umis:
-        if parent in visited: continue
-        parent_map[parent] = parent
-        visited.add(parent)
-        
-        children = []
-        for candidate in unique_umis:
-            if candidate in visited: continue
-            if hamming_distance(parent, candidate) <= threshold:
-                children.append(candidate)
-        
-        for child in children:
-            parent_map[child] = parent
-            visited.add(child)
+        if parent in visited:
+            continue
             
+        # Parent is valid. Now look for children.
+        # Instead of iterating all other UMIs, generate neighbors.
+        
+        parent_len = len(parent)
+        parent_count = counts[parent]
+        
+        # Generate all 1-mismatch neighbors
+        # For L=10, there are 30 neighbors (excluding Ns logic, say max 40)
+        neighbors = set()
+        p_chars = list(parent)
+        
+        for i in range(parent_len):
+            orig = p_chars[i]
+            for b in bases:
+                if b == orig: continue
+                p_chars[i] = b
+                neighbors.add("".join(p_chars))
+            p_chars[i] = orig # Restore
+            
+        # Check which neighbors are in our dataset
+        for child in neighbors:
+            if child in umi_set and child not in visited:
+                child_count = counts[child]
+                
+                # Logic: directional adjacency
+                # Usually we merge if parent count >= (2 * child count) - 1
+                # But here we use zUMIs-like simple logic: merge if parent count >= child count
+                # Since we sorted by count, parent is guaranteed to be >= child (mostly), 
+                # or equal but lexicographically smaller.
+                
+                # To follow strict "directional" method from UMI-tools:
+                # if parent_count >= (2 * child_count) - 1:
+                
+                # Using simple logic consistent with previous implementation:
+                # Merge if valid neighbor found. The sorting priority handles the "best parent" selection.
+                
+                parent_map[child] = parent
+                visited.add(child)
+
     return parent_map
 
 def natural_sort_key(s):
@@ -343,39 +386,65 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
         write_sparse_matrix(final_read_counts['intron'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.intron.read")
         write_sparse_matrix(final_read_counts['inex'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.inex.read")
     
-    # --- PASS 2: BAM Correction ---
-    print("Pass 2: Writing corrected BAM...")
-    tmp_bam_name = out_bam + ".tmp.bam"
+    # --- PASS 2: BAM Correction & Streaming Sort ---
+    print("Pass 2: Correcting BAM and streaming to samtools sort...")
     
-    with pysam.AlignmentFile(bam_file, "rb", threads=threads) as infile:
-        with pysam.AlignmentFile(tmp_bam_name, "wb", template=infile, threads=threads) as outfile:
-            for read in infile:
-                # Process UMI tags if UR exists (Apply to ALL runs, Ham_Dist 0 or >0)
-                if read.has_tag("UR"):
-                    raw_umi = read.get_tag("UR")
+    # Construct samtools sort command
+    # Sorts from stdin (-) to out_bam
+    sort_cmd = [
+        sys.argv[2], # samtools_exec passed from main
+        "sort",
+        "-@", str(threads),
+        "-T", out_bam + ".sort_tmp",
+        "-o", out_bam,
+        "-"
+    ]
+    
+    sort_process = subprocess.Popen(sort_cmd, stdin=subprocess.PIPE, bufsize=10*1024*1024)
+    
+    try:
+        with pysam.AlignmentFile(bam_file, "rb", threads=threads) as infile:
+            # Open a pysam writer pointing to the sort process's stdin
+            # We use "wb" mode and pass the process's stdin as the file
+            # template=infile ensures header is copied
+            with pysam.AlignmentFile(sort_process.stdin, "wb", template=infile) as outfile:
+                for read in infile:
+                    # Process UMI tags if UR exists
+                    if read.has_tag("UR"):
+                        raw_umi = read.get_tag("UR")
+                        
+                        # Check if assigned to gene
+                        if read.has_tag("CB") and read.has_tag("GX"):
+                            bc = read.get_tag("CB")
+                            gene = read.get_tag("GX")
+                            
+                            final_umi = raw_umi
+                            # Apply correction
+                            if ham_dist > 0:
+                                if bc in correction_map and gene in correction_map[bc]:
+                                    if raw_umi in correction_map[bc][gene]:
+                                        final_umi = correction_map[bc][gene][raw_umi]
+                            
+                            read.set_tag("UB", final_umi)
+                        else:
+                            read.set_tag("UB", None)
                     
-                    # Check if assigned to gene
-                    if read.has_tag("CB") and read.has_tag("GX"):
-                        bc = read.get_tag("CB")
-                        gene = read.get_tag("GX")
-                        
-                        final_umi = raw_umi
-                        # Apply correction to UB if available (only relevant if Ham_Dist > 0)
-                        if ham_dist > 0:
-                            if bc in correction_map and gene in correction_map[bc]:
-                                if raw_umi in correction_map[bc][gene]:
-                                    final_umi = correction_map[bc][gene][raw_umi]
-                        
-                        read.set_tag("UB", final_umi)
-                    else:
-                        # NOT assigned to gene: Remove UB tag if it exists (unlikely if UR is used as source)
-                        read.set_tag("UB", None)
-                
-                outfile.write(read)
+                    outfile.write(read)
+                    
+    except Exception as e:
+        print(f"Error during BAM streaming: {e}")
+        sort_process.kill()
+        raise
+    finally:
+        # Close stdin to signal EOF to samtools sort
+        if sort_process.stdin:
+            sort_process.stdin.close()
+        
+        # Wait for sort to finish
+        ret = sort_process.wait()
+        if ret != 0:
+            raise RuntimeError(f"samtools sort failed with return code {ret}")
     
-    print(f"Sorting corrected BAM to {out_bam}...")
-    pysam.sort("-@", str(threads), "-o", out_bam, tmp_bam_name)
-    if os.path.exists(tmp_bam_name): os.remove(tmp_bam_name)
     print("Indexing...")
     pysam.index(out_bam)
 

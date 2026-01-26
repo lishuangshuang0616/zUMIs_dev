@@ -12,6 +12,12 @@ import gzip
 import numpy as np
 import bisect
 
+try:
+    import pysam
+except ImportError:
+    print("Error: 'pysam' module is required. Please install it via pip install pysam")
+    sys.exit(1)
+
 # Try to import plotting libraries
 try:
     import matplotlib
@@ -76,12 +82,35 @@ def cigar_ref_len(cigar):
         num = 0
     return ref_len
 
-def load_exon_models(gtf_file):
+def cigar_ref_blocks_1based(pos_1based, cigar):
+    if not cigar or cigar == '*':
+        return []
+    blocks = []
+    ref_pos = int(pos_1based)
+    num = 0
+    for ch in cigar:
+        o = ord(ch)
+        if 48 <= o <= 57:
+            num = num * 10 + (o - 48)
+            continue
+        if ch in ('M', '=', 'X'):
+            start = ref_pos
+            ref_pos += num
+            end = ref_pos
+            if end > start:
+                blocks.append((start, end))
+        elif ch in ('D', 'N'):
+            ref_pos += num
+        num = 0
+    return blocks
+
+def load_gene_percentiles(gtf_file):
     """
-    Loads exon models, merges adjacent exons, and generates gene models.
-    Returns: dict {gene_id: {'chrom': str, 'strand': str, 'starts': list, 'ends': list, 'cum': list, 'total_len': int}}
+    Loads exon models, merges them, and calculates 100 genomic percentile points for each gene.
+    Mimics RSeQC logic.
+    Returns: dict {gene_id: {'chrom': str, 'strand': str, 'percentiles': list of 100 ints}}
     """
-    print(f"Loading exon models from {gtf_file}...")
+    print(f"Loading gene percentiles from {gtf_file}...")
     gene_exons = collections.defaultdict(list)
     gene_strand = {}
     gene_chrom = {}
@@ -91,13 +120,10 @@ def load_exon_models(gtf_file):
 
     with open(gtf_file, 'r') as f:
         for line in f:
-            if line.startswith('#'):
-                continue
+            if line.startswith('#'): continue
             parts = line.strip().split('\t')
-            if len(parts) < 9:
-                continue
-            if parts[2] != 'exon':
-                continue
+            if len(parts) < 9: continue
+            if parts[2] != 'exon': continue
 
             chrom = parts[0]
             start = int(parts[3])
@@ -114,35 +140,44 @@ def load_exon_models(gtf_file):
                 gene_strand[gene_id] = strand
                 gene_chrom[gene_id] = chrom
     
-    # Merge adjacent exons
     models = {}
     for gene_id, exons in gene_exons.items():
-        exons.sort()  # Sort exons
+        exons.sort()
         merged = []
+        if not exons: continue
+        
         curr_s, curr_e = exons[0]
         for s, e in exons[1:]:
-            if s <= curr_e + 1:  # Adjacent exons
+            if s <= curr_e + 1:
                 curr_e = max(curr_e, e)
             else:
                 merged.append((curr_s, curr_e))
                 curr_s, curr_e = s, e
-        merged.append((curr_s, curr_e))  # Last exon
-
-        starts = [s for s, _ in merged]
-        ends = [e for _, e in merged]
-        cum = []
-        total = 0
+        merged.append((curr_s, curr_e))
+        
+        gene_all_base = []
         for s, e in merged:
-            cum.append(total)
-            total += (e - s + 1)  # Cumulative length
-
+            gene_all_base.extend(range(s, e + 1))
+        
+        if len(gene_all_base) < 100:
+            continue
+            
+        gene_all_base.sort()
+        strand = gene_strand.get(gene_id, '+')
+        if strand == '-':
+            gene_all_base.reverse()
+            
+        points = []
+        size = len(gene_all_base)
+        for i in range(1, 101):
+            # Exact RSeQC formula from mystat.percentile_list
+            idx = int(math.ceil(size * i / 100.0)) - 1
+            points.append(gene_all_base[idx])
+            
         models[gene_id] = {
             "chrom": gene_chrom.get(gene_id),
-            "strand": gene_strand.get(gene_id, '+'),
-            "starts": starts,
-            "ends": ends,
-            "cum": cum,
-            "total_len": total,
+            "strand": strand,
+            "percentiles": sorted(points)
         }
 
     return models
@@ -209,131 +244,158 @@ def load_sparse_stats(matrix_dir):
 
 def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
     """
-    Calculates Mapping Stats & Coverage from BAM file.
-    Returns: dict {Barcode: {Category: Count}} and coverage arrays.
+    Calculates Mapping Stats & Coverage from BAM file using pysam.
+    Optimized:
+    - Uses pysam for faster C parsing.
+    - Limits Coverage calculation to 1M reads (Downsampling) for speed.
+    - Keeps full stats counting for all reads.
     """
     print(f"Calculating Mapping Stats & Coverage from {bam_file}...")
     stats = collections.defaultdict(lambda: collections.defaultdict(int))
     cov_umi = np.zeros(100, dtype=np.int64)
     cov_int = np.zeros(100, dtype=np.int64)
     
-    cmd = [samtools_exec, 'view', bam_file]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    # Downsampling threshold for coverage plot
+    MAX_COV_READS = 1000000
+    cov_reads_processed = 0
     
-    count = 0
-    try:
-        for line in proc.stdout:
+    save = pysam.set_verbosity(0) # Suppress warnings
+    with pysam.AlignmentFile(bam_file, "rb", threads=4) as bam:
+        pysam.set_verbosity(save)
+        
+        count = 0
+        for read in bam:
             count += 1
             if count % 1000000 == 0:
                 print(f"Processed {count} reads...", end='\r')
 
-            parts = line.strip().split('\t')
-            if len(parts) < 12: continue
-
-            flag = int(parts[1])
-            if flag & 0x100 or flag & 0x800: continue  # Exclude secondary/supplementary
+            # Exclude secondary(0x100), supplementary(0x800), duplicate(0x400)
+            if read.flag & 0xD00: continue
             
-            # Count only Read 1 to avoid double counting fragments in PE data
-            if flag & 0x1: # Paired
-                if not (flag & 0x40): # If not Read 1, skip
-                    continue
-            
-            tags = {}
-            for t in parts[11:]:
-                if ':' not in t:
-                    continue
-                tag_parts = t.split(':', 2)
-                if len(tag_parts) != 3:
-                    continue
-                tags[tag_parts[0]] = tag_parts[2]
-            
-            bc = tags.get('CB')
-            if not bc:
-                stats["__NO_CB__"]["Unused BC"] += 1
+            # Get CB tag
+            try:
+                bc = read.get_tag("CB")
+            except KeyError:
+                if read.is_read1:
+                    stats["__NO_CB__"]["Unused BC"] += 1
                 continue
-            bc = bc.strip()
+                
+            # --- 1. Mapping Stats (Full Calculation) ---
+            is_kept = bc in kept_barcodes
+            is_read1 = read.is_read1
             
-            # --- 1. Mapping Stats ---
-            category = "Intergenic"
+            # Fetch tags once
+            tags = dict(read.get_tags())
             source = tags.get('SR')
-            if bc in kept_barcodes:
-                if source == 'UMI':
-                    stats[bc]['UMI_Reads'] += 1
-                elif source == 'Internal':
-                    stats[bc]['Internal_Reads'] += 1
             
-            if 'RE' in tags:
-                re_val = tags['RE']
-                if re_val == 'E':
-                    category = 'Exon'
-                elif re_val == 'N':
-                    category = 'Intron'
-                elif re_val == 'I':
-                    category = 'Intergenic'
+            if is_kept:
+                if is_read1:
+                    if source == 'UMI':
+                        stats[bc]['UMI_Reads'] += 1
+                    elif source == 'Internal':
+                        stats[bc]['Internal_Reads'] += 1
+                
+                category = "Intergenic"
+                if 'RE' in tags:
+                    re_val = tags['RE']
+                    if re_val == 'E': category = 'Exon'
+                    elif re_val == 'N': category = 'Intron'
+                    elif re_val == 'I': category = 'Intergenic'
+                    else: category = re_val
                 else:
-                    category = re_val
+                    if 'GX' in tags: category = "Exon"
+                    elif 'XS' in tags:
+                        status = tags['XS']
+                        if status.startswith("Unassigned_"):
+                            status = status.replace("Unassigned_", "")
+                        if status == "NoFeatures": category = "Intergenic"
+                        else: category = status
+                    else:
+                        if read.is_unmapped: category = "Unmapped"
+                
+                if is_read1:
+                    stats[bc][category] += 1
             else:
-                if 'XS' in tags:
-                    status = tags['XS']
-                    if status.startswith("Unassigned_"):
-                        status = status.replace("Unassigned_", "")
-                    if status == "NoFeatures": category = "Intergenic"
-                    else: category = status
-                else:
-                    flag = int(parts[1])
-                    if flag & 0x4: category = "Unmapped"
+                if is_read1:
+                    stats["__NO_CB__"]["Unused BC"] += 1
             
-            stats[bc][category] += 1
-            
-            # --- 2. Coverage Calculation ---
-            if bc in kept_barcodes and 'GX' in tags and source in ['UMI', 'Internal']:
-                gene_id = tags['GX']
-                model = gene_models.get(gene_id)
-                if not model:
-                    continue
-                if model["total_len"] < 100:
-                    continue
+            # --- 2. Coverage Calculation (Downsampled) ---
+            # Only process if we haven't hit the limit
+            if cov_reads_processed < MAX_COV_READS:
+                if is_kept and 'GX' in tags and source in ['UMI', 'Internal']:
+                    gene_id = tags['GX']
+                    model = gene_models.get(gene_id)
+                    
+                    if model:
+                        # pysam get_blocks() returns list of (start, end) tuples
+                        # These are 0-based, half-open intervals [start, end)
+                        blocks = read.get_blocks()
+                        if not blocks: continue
+                        
+                        pct_points = model["percentiles"]
+                        strand_minus = (model["strand"] == '-')
+                        
+                        # Process blocks
+                        for b_start, b_end in blocks:
+                            # Convert 0-based pysam to coordinates matching 1-based percentiles logic if needed?
+                            # Actually percentiles are genomic coords. 
+                            # RSeQC logic uses genomic coords.
+                            # b_start, b_end are genomic coords.
+                            
+                            # Use bisect to find range of percentile points covered by this block
+                            idx_start = bisect.bisect_left(pct_points, b_start)
+                            idx_end = bisect.bisect_right(pct_points, b_end - 1) # -1 because end is exclusive
+                            
+                            # If the block covers any percentile points
+                            if idx_end > idx_start:
+                                count_range = idx_end - idx_start
+                                # Which bins to increment?
+                                # The indices in pct_points correspond to 0..99 bins
+                                
+                                indices = range(idx_start, idx_end)
+                                
+                                if strand_minus:
+                                    # For negative strand, index 0 in pct_points is the 3' end (high coord)
+                                    # Wait, load_gene_percentiles sorts points:
+                                    #   gene_all_base.sort()
+                                    #   if strand == '-': gene_all_base.reverse()
+                                    #   ... points are picked ...
+                                    #   models[...]["percentiles"] = sorted(points)
+                                    
+                                    # So "percentiles" list is ALWAYS sorted Low -> High.
+                                    # But for Negative strand, the Low coord (index 0 of sorted list) is actually the 100th percentile (3' end).
+                                    # No, let's re-read load_gene_percentiles logic:
+                                    #   idx = int(math.ceil(size * i / 100.0)) - 1
+                                    #   points.append(gene_all_base[idx])
+                                    #   models[...]["percentiles"] = sorted(points)
+                                    
+                                    # If strand is '-', gene_all_base was reversed (High -> Low).
+                                    # So i=1 (1st percentile, 5' end) picks from High coords.
+                                    # i=100 (100th percentile, 3' end) picks from Low coords.
+                                    # But then we perform `sorted(points)`.
+                                    # So pct_points[0] is the Lowest Coordinate.
+                                    # For '-', Lowest Coordinate corresponds to the 100th percentile (3' end).
+                                    # For '+', Lowest Coordinate corresponds to the 1st percentile (5' end).
+                                    
+                                    # So:
+                                    # Strand +: pct_points[i] corresponds to bin i
+                                    # Strand -: pct_points[i] corresponds to bin (99 - i)
+                                    
+                                    # Update arrays
+                                    # We can't do slice increment easily on numpy with iterator, loop is fine for 100 items max
+                                    for i in indices:
+                                        bin_idx = 99 - i
+                                        if source == 'UMI': cov_umi[bin_idx] += 1
+                                        else: cov_int[bin_idx] += 1
+                                else:
+                                    for i in indices:
+                                        bin_idx = i
+                                        if source == 'UMI': cov_umi[bin_idx] += 1
+                                        else: cov_int[bin_idx] += 1
 
-                pos_start = int(parts[3])
-                ref_len = cigar_ref_len(parts[5])
-                if ref_len <= 0:
-                    continue
-                pos = pos_start + (ref_len - 1) // 2
+                        cov_reads_processed += 1
 
-                idx = bisect.bisect_right(model["starts"], pos) - 1
-                if idx < 0:
-                    continue
-                if pos > model["ends"][idx]:
-                    continue
-
-                forward_pos = model["cum"][idx] + (pos - model["starts"][idx])
-                if forward_pos < 0 or forward_pos >= model["total_len"]:
-                    continue
-
-                if model["strand"] == '-':
-                    transcript_pos = model["total_len"] - 1 - forward_pos
-                else:
-                    transcript_pos = forward_pos
-
-                denom = model["total_len"] - 1
-                if denom <= 0:
-                    continue
-                rel_pos = transcript_pos / denom
-                if rel_pos < 0.0:
-                    rel_pos = 0.0
-                elif rel_pos > 1.0:
-                    rel_pos = 1.0
-                bin_idx = int(rel_pos * 99)
-                if source == 'UMI':
-                    cov_umi[bin_idx] += 1
-                else:
-                    cov_int[bin_idx] += 1
-
-    finally:
-        proc.stdout.close()
-        proc.wait()
-        print(f"\nFinished parsing {count} reads.")
-        
+    print(f"\nFinished parsing {count} reads. (Used {cov_reads_processed} for coverage plots)")
     return stats, cov_umi, cov_int
 
 def plot_coverage(cov_umi, cov_int, out_prefix):
@@ -695,13 +757,10 @@ def main():
          
          # Count per gene
          counts_per_gene = collections.defaultdict(int)
-         # Re-parsing just for gene counts is inefficient but robust
-         # Or just skip legacy format? Let's skip for now or rely on matrix stats if needed.
-         # The requested table is per-well, so we focus on that.
     
     # --- 3. Calculate Mapping Stats (Reads) & Coverage ---
     gtf_file = os.path.join(out_dir, f"{project}.final_annot.gtf")
-    gene_models = load_exon_models(gtf_file)
+    gene_models = load_gene_percentiles(gtf_file)
     
     bam_file = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
     read_stats = collections.defaultdict(lambda: collections.defaultdict(int))

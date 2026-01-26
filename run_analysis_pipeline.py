@@ -442,59 +442,66 @@ def run_pipeline_stages(yaml_file):
                 expect_id_barcode_file = os.path.join(out_dir, '../config', 'expect_id_barcode.tsv')
                 
                 if os.path.exists(bc_bin_table):
-                    print(">>> Correcting BC Tags")
-                    correct_processes = []
+                    print(">>> Preparing chunks for Stream Correction (Skipping physical write)...")
                     
                     umi_chunks = []
                     int_chunks = []
 
                     for suffix in chunk_suffixes:
                         raw_bam = os.path.join(tmp_merge_dir, f"{project}.{suffix}.raw.tagged.bam")
-                        # Fixed BAMs now split
-                        fixed_bam_umi = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.umi.bam")
-                        fixed_bam_int = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.internal.bam")
                         
-                        umi_chunks.append(fixed_bam_umi)
-                        int_chunks.append(fixed_bam_int)
-
-                        if os.path.exists(fixed_bam_umi): os.remove(fixed_bam_umi) # Cleanup/Rename logic from before was weird, just process raw
-                        # Note: The previous logic renamed fixed->raw if fixed existed (rerun?).
-                        # Assuming raw exists or was renamed from fixed.
-                        # For safety, let's assume we proceed from raw.
-                        
-                        # Check if old single filtered exists and we are re-running? 
-                        # Ignore complex re-run logic for now, stick to standard flow.
-                        
-                        cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam_umi, fixed_bam_int, bc_bin_table, expect_id_barcode_file]
-
-                        correct_processes.append(subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
-
-                    for p in correct_processes:
-                        _, stderr = p.communicate()
-                        if p.returncode != 0:
-                            raise RuntimeError(f"correct_BCtag failed (rc={p.returncode}): {stderr.strip()}")
+                        # Both UMI and Internal analysis will read the SAME raw BAM
+                        # The filtering happens inside stream_corrector.py via --type argument
+                        if os.path.exists(raw_bam):
+                            umi_chunks.append(raw_bam)
+                            int_chunks.append(raw_bam)
                             
-                    # Merge UMI Chunks
-                    print(">>> Merging UMI and Internal BAM chunks...")
-                    umi_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
-                    int_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
+                    print(f"Prepared {len(umi_chunks)} chunks for streaming.")
                     
-                    # Using samtools cat
-                    subprocess.check_call([samtools, 'cat', '-o', umi_unmapped] + umi_chunks)
-                    subprocess.check_call([samtools, 'cat', '-o', int_unmapped] + int_chunks)
+                    # Merge UMI Chunks logic REMOVED to save IO
+                    print(">>> Skipping physical merge of chunks (will stream to STAR)...")
                     
-                    # Cleanup chunks
-                    for f in umi_chunks + int_chunks:
-                         if os.path.exists(f): os.remove(f)
-
+                    # We keep umi_chunks and int_chunks variables for the Mapping stage
+                    
             if which_stage in ["Filtering", "Mapping"]:
                 print(">>> Starting Mapping Stage")
-                # Updated to pass the two split BAMs
-                umi_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
-                int_unmapped = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
                 
-                map_cmd = ['python3', f'{zumis_dir}/mapping_analysis.py', yaml_file, '--umi_bam', umi_unmapped, '--internal_bam', int_unmapped]
+                umi_arg = ""
+                int_arg = ""
+                
+                # Check if we have chunks from the Filtering step
+                if 'umi_chunks' in locals() and umi_chunks:
+                    umi_arg = ",".join(umi_chunks)
+                else:
+                    # Fallback: check for legacy merged file
+                    legacy_umi = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
+                    if os.path.exists(legacy_umi):
+                        umi_arg = legacy_umi
+                    else:
+                        # Fallback: check for existing chunks on disk if restarting from Mapping?
+                        # This is tricky without metadata. Let's assume legacy merged for restarts.
+                        pass
+
+                if 'int_chunks' in locals() and int_chunks:
+                    int_arg = ",".join(int_chunks)
+                else:
+                    legacy_int = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
+                    if os.path.exists(legacy_int):
+                        int_arg = legacy_int
+
+                map_cmd = ['python3', f'{zumis_dir}/mapping_analysis.py', yaml_file, '--umi_bam', umi_arg, '--internal_bam', int_arg]
                 run_stage_cmd(map_cmd, "mapping_analysis.py")
+                
+                # Cleanup chunks after successful mapping
+                if 'umi_chunks' in locals() and umi_chunks:
+                     print(">>> Cleaning up UMI chunks...")
+                     for f in umi_chunks:
+                         if os.path.exists(f): os.remove(f)
+                
+                if 'int_chunks' in locals() and int_chunks:
+                     print(">>> Cleaning up Internal chunks...")
+                     for f in int_chunks:
+                         if os.path.exists(f): os.remove(f)
 
             if which_stage in ["Filtering", "Mapping", "Counting"]:
                 print(">>> Starting Counting Stage")

@@ -100,6 +100,34 @@ def setup_gtf(config, project, out_dir, samtools):
     param_add = f"--genomeFastaFiles {' '.join(additional_files)}"
     return final_gtf, param_add
 
+def run_star_pipe(corrector_args, star_cmd_str):
+    """
+    Runs a pipeline: Corrector (Python) -> STAR
+    """
+    print(f"Starting Pipeline: {' '.join(corrector_args[:3])}... -> STAR")
+    
+    # Start Producer (Corrector)
+    # Use list args to avoid shell quoting issues with many files
+    p1 = subprocess.Popen(corrector_args, stdout=subprocess.PIPE)
+    
+    # Start Consumer (STAR)
+    # star_cmd_str should use --readFilesIn /dev/stdin
+    p2 = subprocess.Popen(star_cmd_str, shell=True, stdin=p1.stdout)
+    
+    # Close p1's stdout in this parent process so only p2 holds it
+    p1.stdout.close()
+    
+    # Wait for completion
+    p2.wait()
+    p1.wait()
+    
+    if p2.returncode != 0:
+        raise RuntimeError(f"STAR failed with return code {p2.returncode}")
+    
+    # If STAR succeeds, p1 should also succeed (0) or SIGPIPE (141/-13)
+    if p1.returncode not in (0, -13, 141):
+         print(f"Warning: Corrector script exited with code {p1.returncode}")
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -118,96 +146,103 @@ def main():
     star_exec = config.get('STAR_exec', 'STAR')
     star_index = config['reference']['STAR_index']
     
-    # Inputs from args or fallback (though pipeline should provide them)
-    umi_bam = args.umi_bam
-    internal_bam = args.internal_bam
+    # Inputs from args or fallback
+    umi_bam_input = args.umi_bam
+    internal_bam_input = args.internal_bam
     
-    if not umi_bam or not internal_bam:
-        # Fallback to single file logic or error?
-        # Given the refactor, let's assume pipeline is updated.
-        # But if running manually, maybe check defaults.
-        umi_bam = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
-        internal_bam = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
+    umi_bams = []
+    internal_bams = []
+
+    if umi_bam_input:
+        umi_bams = [f.strip() for f in umi_bam_input.split(',')]
+    else:
+        # Fallback legacy check
+        default_umi = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
+        if os.path.exists(default_umi):
+            umi_bams = [default_umi]
+
+    if internal_bam_input:
+        internal_bams = [f.strip() for f in internal_bam_input.split(',')]
+    else:
+        # Fallback legacy check
+        default_int = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
+        if os.path.exists(default_int):
+            internal_bams = [default_int]
     
-    if not os.path.exists(umi_bam) and not os.path.exists(internal_bam):
-        raise FileNotFoundError("Input unmapped BAMs not found.")
+    # Check existence
+    for f in umi_bams:
+        if not os.path.exists(f):
+            raise FileNotFoundError(f"Input UMI BAM not found: {f}")
+    for f in internal_bams:
+        if not os.path.exists(f):
+            raise FileNotFoundError(f"Input Internal BAM not found: {f}")
+
+    if not umi_bams and not internal_bams:
+        raise FileNotFoundError("No input unmapped BAMs found.")
 
     # 2. Setup GTF
     final_gtf, param_add_fa = setup_gtf(config, project, out_dir, samtools)
     
-    # 3. Determine Read Length (Use UMI bam as representative)
+    # 3. Determine Read Length (Use first available UMI bam)
     read_len = 0
-    if os.path.exists(umi_bam):
-        read_len = get_bam_read_length(umi_bam, samtools)
-    elif os.path.exists(internal_bam):
-        read_len = get_bam_read_length(internal_bam, samtools)
+    if umi_bams:
+        read_len = get_bam_read_length(umi_bams[0], samtools)
+    elif internal_bams:
+        read_len = get_bam_read_length(internal_bams[0], samtools)
         
     print(f"Detected Read Length: {read_len}")
     
     # 4. Resource Allocation
-    # User requested: 3/4 threads for UMI, 1/4 for Internal
-    # Reserve threads for SAMtools inside STAR? Usually --runThreadN is mapping threads.
-    # STAR also spawns sorting/BAM writing threads.
-    
-    # Let's allocate raw threads to --runThreadN
-    
-    t_umi = max(1, int(num_threads * 0.75))
-    t_int = max(1, num_threads - t_umi)
-    
-    print(f"Allocating threads: UMI={t_umi}, Internal={t_int} (Total {num_threads})")
+    print(f"Allocating {num_threads} threads for sequential execution.")
 
     # 5. Build STAR Commands
     read_layout = config.get('read_layout', 'SE')
     
-    defaults_umi = f"--readFilesCommand {samtools} view -@ {max(1, int(t_umi/4))} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --quantMode TranscriptomeSAM --limitOutSJcollapsed 5000000"
-    defaults_int = f"--readFilesCommand {samtools} view -@ {max(1, int(t_int/4))} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --quantMode TranscriptomeSAM --limitOutSJcollapsed 5000000"
+    # Define paths for corrector
+    corrector_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream_corrector.py")
+    bc_bin_file = os.path.join(out_dir, "zUMIs_output", f"{project}.BCbinning.txt")
+    expect_id_file = os.path.join(out_dir, "../config", "expect_id_barcode.tsv")
     
-    # Note: Using separate genomeDir loading might cause memory issues if RAM is tight.
-    # But parallel execution requires it unless using LoadAndKeep.
-    # We will proceed with standard parallel execution.
-    
-    misc_umi = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {t_umi} --sjdbOverhang {read_len-1} --readFilesType SAM {read_layout}"
-    misc_int = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {t_int} --sjdbOverhang {read_len-1} --readFilesType SAM {read_layout}"
+    # Base params (Common)
+    # Important: readFilesType SAM because our corrector outputs uncompressed BAM (which STAR treats as SAM/BAM stream)
+    # STAR auto-detects BAM vs SAM if we say SAM usually, or we can use BAM Unsorted
+    misc_base = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {num_threads} --sjdbOverhang {read_len-1} --readFilesType SAM {read_layout} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --quantMode TranscriptomeSAM --limitOutSJcollapsed 5000000"
     
     extra_params = config['reference'].get('additional_STAR_params', '') or ""
     
-    star_cmd_umi_base = f"{star_exec} {defaults_umi} {misc_umi} {extra_params} {param_add_fa}"
-    star_cmd_int_base = f"{star_exec} {defaults_int} {misc_int} {extra_params} {param_add_fa}"
-    
+    # Two-pass mode
+    twopass = ""
     if config['counting_opts'].get('twoPass', False):
-        star_cmd_umi_base += " --twopassMode Basic"
-        star_cmd_int_base += " --twopassMode Basic"
-
-    procs = []
+        twopass = "--twopassMode Basic"
 
     # Run UMI
-    if os.path.exists(umi_bam):
+    if umi_bams:
         prefix_umi = os.path.join(out_dir, f"{project}.filtered.tagged.umi.")
-        cmd_umi = f"{star_cmd_umi_base} --readFilesIn {umi_bam} --outFileNamePrefix {prefix_umi}"
-        print("Starting STAR for UMI...")
-        p_umi = subprocess.Popen(cmd_umi, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        procs.append(("UMI", p_umi))
+        
+        # Corrector Args (Producer)
+        corrector_args = ['python3', corrector_script, '--binning', bc_bin_file, '--idmap', expect_id_file, '--type', 'umi'] + umi_bams
+        
+        # STAR Command (Consumer)
+        # --readFilesIn /dev/stdin
+        cmd_umi = f"{star_exec} {misc_base} {extra_params} {param_add_fa} {twopass} --readFilesIn /dev/stdin --outFileNamePrefix {prefix_umi}"
+        
+        run_star_pipe(corrector_args, cmd_umi)
+        print("STAR UMI finished.")
 
     # Run Internal
-    if os.path.exists(internal_bam):
+    if internal_bams:
         prefix_int = os.path.join(out_dir, f"{project}.filtered.tagged.internal.")
-        cmd_int = f"{star_cmd_int_base} --readFilesIn {internal_bam} --outFileNamePrefix {prefix_int}"
-        print("Starting STAR for Internal...")
-        p_int = subprocess.Popen(cmd_int, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        procs.append(("Internal", p_int))
         
-    # Wait
-    failed = False
-    for name, p in procs:
-        _, stderr = p.communicate()
-        if p.returncode != 0:
-            print(f"STAR {name} failed (rc={p.returncode}): {stderr.strip()}")
-            failed = True
-        else:
-            print(f"STAR {name} finished successfully.")
-            
-    if failed:
-        raise RuntimeError("One or more STAR instances failed.")
+        # Corrector Args
+        corrector_args = ['python3', corrector_script, '--binning', bc_bin_file, '--idmap', expect_id_file, '--type', 'internal'] + internal_bams
+        
+        # STAR Command
+        cmd_int = f"{star_exec} {misc_base} {extra_params} {param_add_fa} {twopass} --readFilesIn /dev/stdin --outFileNamePrefix {prefix_int}"
+        
+        run_star_pipe(corrector_args, cmd_int)
+        print("STAR Internal finished.")
+        
+
 
 if __name__ == "__main__":
     main()

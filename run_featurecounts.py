@@ -133,6 +133,7 @@ def run_featurecounts_cmd(input_bam, saf_file, out_prefix, threads, strand_mode,
     
     cmd = [
         'featureCounts',
+        '-M',
         '-a', saf_file,
         '-F', 'SAF',
         '-o', output_counts,
@@ -168,15 +169,19 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
     Adds RE:Z:E/N/I tag.
     Adds GN:Z:GeneName tag based on GX tag and gene_map.
     Adds SR:Z:Source tag (UMI/Internal) if provided.
-    Input BAMs are sorted by name to ensure sync.
+    Input BAMs are ASSUMED to be sorted by name (output from featureCounts on name-sorted input).
     """
     print(f"Merging Exon and Intron BAMs into {out_bam} (Source: {source_label})...")
     
     sort_threads = max(1, int(threads) // 2)
     buf_size = 64 * 1024 * 1024
     
-    cmd_ex = [samtools_exec, 'sort', '-n', '-O', 'sam', '-@', str(sort_threads), '-o', '-', bam_ex]
-    cmd_in = [samtools_exec, 'sort', '-n', '-O', 'sam', '-@', str(sort_threads), '-o', '-', bam_in]
+    # Force sort by name to ensure synchronization
+    # Even if input was sorted, featureCounts multiple threads might result in slightly different output order
+    cmd_ex = [samtools_exec, 'sort', '-n', '-O', 'sam', '-@', str(sort_threads), '-T', bam_ex + ".sort_tmp", '-o', '-', bam_ex]
+    cmd_in = [samtools_exec, 'sort', '-n', '-O', 'sam', '-@', str(sort_threads), '-T', bam_in + ".sort_tmp", '-o', '-', bam_in]
+    
+    buf_size = 64 * 1024 * 1024
     
     proc_ex = subprocess.Popen(cmd_ex, stdout=subprocess.PIPE, text=True, bufsize=buf_size)
     proc_in = subprocess.Popen(cmd_in, stdout=subprocess.PIPE, text=True, bufsize=buf_size)
@@ -189,7 +194,7 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
     read_line_in = None
 
     try:
-        # Process header
+        # Process header from Exon stream only
         while True:
             line = proc_ex.stdout.readline()
             if not line: break
@@ -198,14 +203,15 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
             else:
                 read_line_ex = line
                 break
-                
+        
+        # Skip header from Intron stream
         while True:
             line = proc_in.stdout.readline()
             if not line: break
             if not line.startswith('@'):
                 read_line_in = line
                 break
-                
+
         count = 0
         while read_line_ex and read_line_in:
             count += 1
