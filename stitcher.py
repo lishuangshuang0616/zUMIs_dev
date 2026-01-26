@@ -2,6 +2,7 @@
 # V 2.0
 # anton jm larsson anton.larsson@ki.se
 import argparse
+import gzip
 import pysam
 import warnings
 import numpy as np
@@ -10,9 +11,12 @@ import itertools
 import time
 import os
 import json
+import tempfile
+import shutil
 from scipy.special import logsumexp
 from joblib import delayed,Parallel
 from multiprocessing import Process, Manager
+from multiprocessing.managers import SyncManager
 __version__ = '2.0'
 nucleotides = ['A', 'T', 'C', 'G']
 nuc_dict = {'A':0, 'T':1, 'C':2, 'G':3, 'N': 4}
@@ -21,6 +25,17 @@ ll_this_correct = {i:np.log(1-10**(-float(i)/10)) for i in range(1,94)}
 ln_3 = np.log(3)
 ll_other_correct = {i:-(float(i)*np.log(10))/10 - ln_3 for i in range(1,94)}
 ll_N = -np.log(4)
+
+# Pre-compute likelihood arrays globally to avoid re-computation and warnings
+# Handle Q=0 case explicitly (P(error)=1, P(correct)=0 -> log(0)=-inf)
+LL_THIS_ARR = np.full(256, -np.inf, dtype=np.float64)
+LL_OTHER_ARR = np.full(256, -np.inf, dtype=np.float64)
+_qs = np.arange(0, 94, dtype=np.float64)
+# Suppress divide by zero warning for Q=0
+with np.errstate(divide='ignore'):
+    LL_THIS_ARR[:94] = np.log(1 - np.power(10.0, -_qs / 10.0))
+LL_OTHER_ARR[:94] = -(_qs * np.log(10.0)) / 10.0 - np.log(3.0)
+
 def make_ll_array(e):
     y = np.array([e[0]/3,e[0]/3,e[0]/3,e[0]/3])
     if e[1] != 4:
@@ -165,11 +180,9 @@ def stitch_reads(read_d, single_end, cell, gene, umi, UMI_tag):
 
     sorted_ref = np.sort(ref_pos_set_array)
 
-    ll_this_arr = np.full(256, -np.inf, dtype=np.float64)
-    ll_other_arr = np.full(256, -np.inf, dtype=np.float64)
-    qs = np.arange(0, 94, dtype=np.float64)
-    ll_this_arr[:94] = np.log(1 - np.power(10.0, -qs / 10.0))
-    ll_other_arr[:94] = -(qs * np.log(10.0)) / 10.0 - np.log(3.0)
+    # Use global likelihood arrays
+    ll_this_arr = LL_THIS_ARR
+    ll_other_arr = LL_OTHER_ARR
 
     base_to_idx = np.full(256, -1, dtype=np.int8)
     base_to_idx[ord('A')] = 0
@@ -272,7 +285,11 @@ def get_compatible_isoforms_stitcher(mol_list, isoform_dict_json,refskip_dict_js
             else:
                 new_mol_list.append((success,m.to_string()))
             continue
-        mol = pysam.AlignedRead.fromstring(m,h)
+        try:
+            mol = pysam.AlignedSegment.fromstring(m, h)
+        except (AttributeError, NameError):
+            mol = pysam.AlignedRead.fromstring(m, h)
+            
         i = interval(intervals_extract(mol.get_reference_positions()))
         refskip_cigar = [t[0] for t in mol.cigartuples if t[1] > 0 and t[0] in [2,3]]
         blocks = mol.get_blocks()
@@ -303,64 +320,70 @@ def assemble_reads(bamfile,gene_to_stitch, cell_set, isoform_dict_json,refskip_d
     read_dict = {}
     bam = pysam.AlignmentFile(bamfile, 'rb')
     gene_of_interest = gene_to_stitch['gene_id']
-    for read in bam.fetch(gene_to_stitch['seqid'], gene_to_stitch['start'], gene_to_stitch['end']):
-        if read.has_tag(cell_tag):
-            cell = read.get_tag(cell_tag)
-        else:
-            continue
-        if cell_set is not None:
-            if cell not in cell_set:
+    try:
+        for read in bam.fetch(gene_to_stitch['seqid'], gene_to_stitch['start'], gene_to_stitch['end']):
+            if read.has_tag(cell_tag):
+                cell = read.get_tag(cell_tag)
+            else:
                 continue
-        umi = read.get_tag(UMI_tag)
-        if umi == '':
-            continue
-        else:
-            if read.has_tag('GE'):
-                gene_exon = read.get_tag('GE')
-            elif read.has_tag('GX') and read.has_tag('RE') and read.get_tag('RE') == 'E':
-                gene_exon = read.get_tag('GX')
+            if cell_set is not None:
+                if cell not in cell_set:
+                    continue
+            try:
+                umi = read.get_tag(UMI_tag)
+            except KeyError:
+                continue
+            if umi == '':
+                continue
             else:
-                gene_exon = 'Unassigned'
-            
-            if read.has_tag('GI'):
-                gene_intron = read.get_tag('GI')
-            elif read.has_tag('GX') and read.has_tag('RE') and read.get_tag('RE') == 'N':
-                gene_intron = read.get_tag('GX')
-            else:
-                gene_intron = 'Unassigned'
-            # if it maps to the intron or exon of a gene
-            if gene_intron != 'Unassigned' or gene_exon != 'Unassigned':
-                # if it is a junction read
-                if gene_intron == gene_exon:
-                    gene = gene_intron
-                    # if it's an only intronic read
-                elif gene_intron != 'Unassigned' and gene_exon == 'Unassigned':
-                    gene = gene_intron
-                    # if it's an only exonic read
-                elif gene_exon != 'Unassigned' and gene_intron == 'Unassigned':
-                    gene = gene_exon
-                    # if the exon and intron gene tag contradict each other
+                if read.has_tag('GE'):
+                    gene_exon = read.get_tag('GE')
+                elif read.has_tag('GX') and read.has_tag('RE') and read.get_tag('RE') == 'E':
+                    gene_exon = read.get_tag('GX')
+                else:
+                    gene_exon = 'Unassigned'
+                
+                if read.has_tag('GI'):
+                    gene_intron = read.get_tag('GI')
+                elif read.has_tag('GX') and read.has_tag('RE') and read.get_tag('RE') == 'N':
+                    gene_intron = read.get_tag('GX')
+                else:
+                    gene_intron = 'Unassigned'
+                if gene_intron != 'Unassigned' or gene_exon != 'Unassigned':
+                    if gene_intron == gene_exon:
+                        gene = gene_intron
+                    elif gene_intron != 'Unassigned' and gene_exon == 'Unassigned':
+                        gene = gene_intron
+                    elif gene_exon != 'Unassigned' and gene_intron == 'Unassigned':
+                        gene = gene_exon
+                    else:
+                        continue
                 else:
                     continue
+            if single_end:
+                if gene == gene_of_interest and not read.is_unmapped:
+                    node = (cell, gene, umi)
+                    if node in read_dict:
+                        read_dict[node].append(read)
+                    else:
+                        read_dict[node] = [read]
             else:
-                continue
-        if single_end:
-            if gene == gene_of_interest and not read.is_unmapped:
-                node = (cell, gene, umi)
-                if node in read_dict:
-                    read_dict[node].append(read)
-                else:
-                    read_dict[node] = [read]
-        else:
-            if read.is_paired and not read.is_unmapped and not read.mate_is_unmapped and gene == gene_of_interest and read.is_proper_pair:
-                node = (cell, gene, umi)
-                if node in read_dict:
-                    read_dict[node].append(read)
-                else:
-                    read_dict[node] = [read]
+                if read.is_paired and not read.is_unmapped and not read.mate_is_unmapped and gene == gene_of_interest and read.is_proper_pair:
+                    node = (cell, gene, umi)
+                    if node in read_dict:
+                        read_dict[node].append(read)
+                    else:
+                        read_dict[node] = [read]
+    finally:
+        bam.close()
     mol_list = []
     mol_append = mol_list.append
     for node, mol in read_dict.items():
+        # Safety: Limit the number of reads per UMI to prevent memory spikes/segfaults
+        if len(mol) > 1000:
+             # Take top 1000 reads (or random, but top is faster/stable)
+             mol = mol[:1000]
+             
         n_read1 = np.sum([(r.is_read1)&(r.get_tag(UMI_tag) != '') for r in mol])
         if n_read1 > 0:
             mol_append(stitch_reads(mol, single_end, node[0], node[1], node[2], UMI_tag))
@@ -448,29 +471,48 @@ def yield_reads(read_dict):
 def create_write_function(filename, bamfile, version):
     bam = pysam.AlignmentFile(bamfile, 'rb')
     header = bam.header
+    bam.close()
     
     def write_sam_file(q):
         error_file = open('{}_error.log'.format(os.path.splitext(filename)[0]), 'w')
         stitcher_bam = pysam.AlignmentFile(filename,'wb',header={'HD':header['HD'], 'SQ':header['SQ'], 'PG': [{'ID': 'stitcher.py','VN': '{}'.format(version)}]})
+        written = 0
+        failed = 0
         while True:
-            good, mol_list = q.get()
-            if good is None: break
-            if good:
-                g = ''
-                for success, mol in mol_list:
-                    if success:
-                        read = pysam.AlignedRead.fromstring(mol,header)
-                        if g == '':
-                            g = read.get_tag('XT')
-                        stitcher_bam.write(read)
-                    else:
-                        error_file.write(mol+'\n')
-                if g != '':
-                    error_file.write('Gene:{}\n'.format(g))
-            q.task_done()
-        q.task_done()
+            item = q.get()
+            try:
+                good, mol_list = item
+                if good is None:
+                    q.task_done()
+                    break
+                if good:
+                    g = ''
+                    for success, mol in mol_list:
+                        if success:
+                            try:
+                                read = pysam.AlignedSegment.fromstring(mol, header)
+                            except Exception:
+                                read = pysam.AlignedRead.fromstring(mol, header)
+                            if g == '':
+                                try:
+                                    if read.has_tag('GX'):
+                                        g = read.get_tag('GX')
+                                except Exception:
+                                    g = ''
+                            stitcher_bam.write(read)
+                            written += 1
+                        else:
+                            error_file.write(mol + '\n')
+                            failed += 1
+                    if g != '':
+                        error_file.write('Gene:{}\n'.format(g))
+            except Exception as e:
+                error_file.write('WriterError:{}\n'.format(repr(e)))
+            finally:
+                q.task_done()
         error_file.close()
         stitcher_bam.close()
+        sys.stderr.write('Writer finished. Written reads: {}, Failed entries: {}\n'.format(written, failed))
         return None
     return write_sam_file
 
@@ -479,7 +521,11 @@ def extract(d, keys):
     
 def construct_stitched_molecules(infile, outfile,gtffile,isoformfile, junctionfile, cells, gene_file, contig, threads, single_end, cell_tag, UMI_tag, gene_identifier, skip_iso, q, version):
     if cells is not None:
-        cell_set = set([line.rstrip() for line in open(cells)])
+        if cells.endswith('.gz'):
+            with gzip.open(cells, 'rt') as f:
+                cell_set = set([line.rstrip() for line in f])
+        else:
+            cell_set = set([line.rstrip() for line in open(cells)])
     else:
         cell_set = None
     print('Reading gene info from {}'.format(gtffile))
@@ -510,6 +556,8 @@ def construct_stitched_molecules(infile, outfile,gtffile,isoformfile, junctionfi
                     except:
                         gene_list.append({'gene_id': l[8].split(' ')[1].replace('"', '').strip(';\n'), 'seqid':l[0], 'start':int(l[3]), 'end':int(l[4])})
     gene_dict = {g['gene_id']: g for g in gene_list}
+    if len(gene_dict) == 0:
+        raise RuntimeError('No genes loaded from GTF. Check --contig and contig naming between BAM and GTF.')
     
     if gene_file is not None and gene_file != 'None':
         gene_set = set([line.rstrip() for line in open(gene_file)])
@@ -526,23 +574,97 @@ def construct_stitched_molecules(infile, outfile,gtffile,isoformfile, junctionfi
     bam.close()
     if skip_iso:
         print('Skipping isoform info')
-        params = Parallel(n_jobs=threads, verbose = 3, backend='loky')(delayed(assemble_reads)(infile, gene, cell_set,None, None, single_end, cell_tag, UMI_tag, q) for g,gene in gene_dict.items())
+        genes_to_run = list(gene_dict.values())
+        print('Genes scheduled for stitching: {}'.format(len(genes_to_run)))
+        _ = Parallel(
+            n_jobs=threads,
+            verbose=3,
+            backend='loky',
+            temp_folder=os.environ.get("JOBLIB_TEMP_FOLDER"),
+        )(
+            delayed(assemble_reads)(infile, gene, cell_set, None, None, single_end, cell_tag, UMI_tag, q)
+            for gene in genes_to_run
+        )
+        del _
     else:    
         print('Reading isoform info from {}'.format(isoformfile))
         with open(isoformfile) as json_file:
             isoform_unique_intervals = json.load(json_file)
         with open(junctionfile) as json_file:
             refskip_unique_intervals = json.load(json_file)
-        params = Parallel(
-            n_jobs=threads, verbose = 3, backend='loky'
-            )(
+        genes_to_run = [gene for g, gene in gene_dict.items() if g in isoform_unique_intervals and g in refskip_unique_intervals]
+        print('Genes scheduled for stitching: {}'.format(len(genes_to_run)))
+        if len(genes_to_run) == 0:
+            raise RuntimeError('No genes matched isoform/junction dictionaries. Check gene IDs and contig naming.')
+        _ = Parallel(
+            n_jobs=threads,
+            verbose=3,
+            backend='loky',
+            temp_folder=os.environ.get("JOBLIB_TEMP_FOLDER"),
+        )(
                 delayed(assemble_reads)(
                     infile, gene, cell_set,isoform_unique_intervals[g],refskip_unique_intervals[g],single_end, cell_tag, UMI_tag, q
                     ) for g,gene in gene_dict.items() if g in isoform_unique_intervals and g in refskip_unique_intervals
                     )
+        del _
 
 
     return None
+
+def _safe_makedirs(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+def _select_tmp_root(preferred):
+    if preferred:
+        return preferred
+    for k in ("MHSFLT_TMPDIR", "TMPDIR", "TEMP", "TMP"):
+        v = os.environ.get(k)
+        if v:
+            return v
+    return None
+
+def _prepare_tmpdir(requested_tmpdir, output_path):
+    root = _select_tmp_root(requested_tmpdir)
+    candidates = []
+    if requested_tmpdir:
+        candidates.append(requested_tmpdir)
+    candidates.append("/tmp")
+    if root and root not in candidates:
+        candidates.append(root)
+    candidates.append(os.path.dirname(os.path.abspath(output_path)))
+
+    for base in candidates:
+        if not base:
+            continue
+        if _safe_makedirs(base):
+            try:
+                d = tempfile.mkdtemp(prefix="stitcher_tmp_", dir=base)
+                if len(d) <= 80:
+                    return d
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+    return tempfile.mkdtemp(prefix="stitcher_tmp_")
+
+def _start_sync_manager(tmpdir):
+    m = SyncManager(address=("127.0.0.1", 0))
+    m.start()
+    return m
+
+def _shutdown_joblib_loky():
+    try:
+        from joblib.externals.loky import get_reusable_executor
+        ex = get_reusable_executor()
+        ex.shutdown(wait=True)
+    except Exception:
+        pass
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stitch together molecules from reads sharing the same UMI')
@@ -555,11 +677,12 @@ if __name__ == '__main__':
     parser.add_argument('--single-end', action='store_true', help='Activate flag if data is single-end')
     parser.add_argument('--skip-iso', action='store_true', help='Skip isoform calling')
     parser.add_argument('--UMI-tag', type=str, default='UB', help='UMI tag to group reads')
-    parser.add_argument('--cell-tag', type=str, default='BC', help='cell baroced tag to group reads')
+    parser.add_argument('--cell-tag', type=str, default='CB', help='cell baroced tag to group reads')
     parser.add_argument('--cells', default=None, metavar='cells', type=str, help='List of cell barcodes to stitch molecules')
     parser.add_argument('--genes', default=None, metavar='genes', type=str, help='List of gene,  one per line.')
     parser.add_argument('--contig', default=None, metavar='contig', type=str, help='Restrict stitching to contig')
     parser.add_argument('--gene-identifier', default='gene_id', metavar='gene_identifier', type=str, help='Gene identifier (gene_id or gene_name)')
+    parser.add_argument('--tmpdir', default=None, metavar='tmpdir', type=str, help='Temporary directory for parallel workers')
     parser.add_argument('-v', '--version', action='version', version='%(prog)s ' + __version__)
     args = parser.parse_args()
     infile = args.input
@@ -572,9 +695,15 @@ if __name__ == '__main__':
     if gtffile is None:
         raise Exception('No gtf file provided.')
     skip_iso = args.skip_iso
+    isoformfile = args.isoform
+    junctionfile = args.junction
+    
     if not skip_iso:
-        isoformfile = args.isoform
-        junctionfile = args.junction
+        if isoformfile is None or junctionfile is None:
+            warnings.warn('Warning: Both --isoform and --junction files are required for isoform calling. Skipping isoform calling.')
+            skip_iso = True
+            isoformfile = ''
+            junctionfile = ''
     else:
         isoformfile = ''
         junctionfile = ''
@@ -586,17 +715,46 @@ if __name__ == '__main__':
     UMI_tag = args.UMI_tag
     cell_tag = args.cell_tag
     gene_identifier = args.gene_identifier
-    m = Manager()
-    q = m.JoinableQueue()
-    p = Process(target=create_write_function(filename=outfile, bamfile=infile, version=__version__), args=(q,))
-    p.start()
-    
-    print('Stitching reads for {}'.format(infile))
-    
-    start = time.time()
-    construct_stitched_molecules(infile, outfile, gtffile, isoformfile,junctionfile, cells, gene_file, contig, threads,single_end,cell_tag, UMI_tag,gene_identifier, skip_iso, q, __version__)
-    q.put((None,None))
-    p.join()
-    end = time.time()
-    
-    print('Finished writing stitched molecules from {} to {}, took {}'.format(infile, outfile, get_time_formatted(end-start)))
+    tmpdir = _prepare_tmpdir(args.tmpdir, outfile)
+    os.environ["TMPDIR"] = tmpdir
+    os.environ["JOBLIB_TEMP_FOLDER"] = tmpdir
+    tempfile.tempdir = tmpdir
+    m = None
+    p = None
+    try:
+        m = _start_sync_manager(tmpdir)
+        q = m.JoinableQueue()
+        p = Process(target=create_write_function(filename=outfile, bamfile=infile, version=__version__), args=(q,))
+        p.start()
+        
+        print('Stitching reads for {}'.format(infile))
+        
+        start = time.time()
+        construct_stitched_molecules(infile, outfile, gtffile, isoformfile,junctionfile, cells, gene_file, contig, threads,single_end,cell_tag, UMI_tag,gene_identifier, skip_iso, q, __version__)
+        _shutdown_joblib_loky()
+        q.put((None,None))
+        p.join()
+        if p.exitcode not in (0, None):
+            raise RuntimeError('Writer process failed with exit code {}'.format(p.exitcode))
+        
+        print('Waiting for file system to release resources...')
+        time.sleep(3)
+        
+        end = time.time()
+        
+        print('Finished writing stitched molecules from {} to {}, took {}'.format(infile, outfile, get_time_formatted(end-start)))
+    finally:
+        if p is not None and p.is_alive():
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        if m is not None:
+            try:
+                m.shutdown()
+            except Exception:
+                pass
+    try:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
