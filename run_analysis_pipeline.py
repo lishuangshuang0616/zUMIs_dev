@@ -8,7 +8,6 @@ import copy
 import sys
 import subprocess
 import shutil
-import pipeline_modules
 from datetime import datetime
 import multiprocessing
 import gzip
@@ -242,11 +241,30 @@ def modify_yaml(data, fq1_names, fq2_names):
     del new_data['sample']
     new_data['out_dir'] = f'{out_path}/analysis'
 
-    # Add default executables if not present
-    if 'samtools_exec' not in new_data: new_data['samtools_exec'] = 'samtools'
-    if 'pigz_exec' not in new_data: new_data['pigz_exec'] = 'pigz'
-    if 'STAR_exec' not in new_data: new_data['STAR_exec'] = 'STAR'
-    if 'Rscript_exec' not in new_data: new_data['Rscript_exec'] = 'Rscript'
+    # Detect and enforce software paths from 'software' directory if present
+    software_dir = os.path.join(data['zUMIs_directory'], 'software')
+    
+    def resolve_tool(tool_name, config_key):
+        # 1. Check software dir
+        candidate = os.path.join(software_dir, tool_name)
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return os.path.abspath(candidate)
+        # 2. Keep existing config if set
+        if config_key in new_data:
+            return new_data[config_key]
+        # 3. Default to name
+        return tool_name
+
+    new_data['samtools_exec'] = resolve_tool('samtools', 'samtools_exec')
+    new_data['pigz_exec'] = resolve_tool('pigz', 'pigz_exec')
+    new_data['STAR_exec'] = resolve_tool('STAR', 'STAR_exec')
+    new_data['featureCounts_exec'] = resolve_tool('featureCounts', 'featureCounts_exec')
+    
+    # Rscript usually not in local software dir, but check if needed. Keeping as is for now.
+    if 'Rscript_exec' in new_data:
+        # Optional: could also verify Rscript
+        pass
+
     if 'zUMIs_directory' not in new_data: new_data['zUMIs_directory'] = data['zUMIs_directory']
 
     class ForceStr:
@@ -301,8 +319,25 @@ def run_pipeline_stages(yaml_file):
     # Executables
     samtools = config.get('samtools_exec', 'samtools')
     pigz = config.get('pigz_exec', 'pigz')
-    rscript = config.get('Rscript_exec', 'Rscript')
     zumis_dir = config.get('zUMIs_directory', '.')
+
+    exec_env = os.environ.copy()
+    software_dir = os.path.join(zumis_dir, 'software')
+    if sys.platform.startswith('linux') and os.path.isdir(software_dir):
+        exec_env['PATH'] = software_dir + os.pathsep + exec_env.get('PATH', '')
+    zumis_src_dir = os.path.join(zumis_dir, 'src')
+    if os.path.isdir(zumis_src_dir) and zumis_src_dir not in sys.path:
+        sys.path.insert(0, zumis_src_dir)
+    import pipeline_modules
+
+    def resolve_script(script_name):
+        direct = os.path.join(zumis_dir, script_name)
+        if os.path.exists(direct):
+            return direct
+        in_src = os.path.join(zumis_dir, 'src', script_name)
+        if os.path.exists(in_src):
+            return in_src
+        raise FileNotFoundError(f"Script not found: {script_name}. Tried: {direct}, {in_src}")
     
     class Tee:
         def __init__(self, *streams):
@@ -345,7 +380,7 @@ def run_pipeline_stages(yaml_file):
                     cmd_str = " ".join(cmd)
                 else:
                     cmd_str = str(cmd)
-                res = subprocess.run(cmd, stdout=run_log, stderr=subprocess.STDOUT, shell=shell)
+                res = subprocess.run(cmd, stdout=run_log, stderr=subprocess.STDOUT, shell=shell, env=exec_env)
                 if res.returncode != 0:
                     run_log.flush()
                     try:
@@ -424,25 +459,25 @@ def run_pipeline_stages(yaml_file):
                 
                 processes = []
                 for suffix in chunk_suffixes:
-                    cmd = ['python3', f'{zumis_dir}/fqfilter.py', yaml_file, samtools, rscript, pigz, zumis_dir, suffix]
+                    cmd = ['python3', resolve_script('fqfilter.py'), yaml_file, samtools, pigz, zumis_dir, suffix]
                     
                     if max_reads and int(max_reads) > 0:
                         chunk_limit = int(int(max_reads) / len(chunk_suffixes))
                         if chunk_limit < 1: chunk_limit = 1
                         cmd.extend(['--limit', str(chunk_limit)])
                         
-                    processes.append(subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                    processes.append(subprocess.Popen(cmd, stdout=run_log, stderr=subprocess.STDOUT, env=exec_env))
 
                 for p in processes:
-                    _, stderr = p.communicate()
+                    p.wait()
                     if p.returncode != 0:
-                        raise RuntimeError(f"fqfilter failed (rc={p.returncode}): {stderr.strip()}")
+                        raise RuntimeError(f"fqfilter failed (rc={p.returncode}). Check {log_path} for details.")
 
                 print(">>> Merging BAM Stats")
                 pipeline_modules.merge_bam_stats(tmp_merge_dir, project, out_dir, yaml_file, samtools)
 
                 print(">>> Running Barcode Detection")
-                run_stage_cmd(["python3", f"{zumis_dir}/zUMIs_BCdetection.py", yaml_file], "BCdetection")
+                run_stage_cmd(["python3", resolve_script("zUMIs_BCdetection.py"), yaml_file], "BCdetection")
 
                 bc_bin_table = os.path.join(out_dir, 'zUMIs_output', f"{project}.BCbinning.txt")
                 expect_id_barcode_file = os.path.join(out_dir, '../config', 'expect_id_barcode.tsv')
@@ -467,14 +502,14 @@ def run_pipeline_stages(yaml_file):
                         if os.path.exists(fixed_bam_umi): os.remove(fixed_bam_umi) 
                         if os.path.exists(fixed_bam_int): os.remove(fixed_bam_int)
                         
-                        cmd_args = ['python3', f'{zumis_dir}/correct_BCtag.py', raw_bam, fixed_bam_umi, fixed_bam_int, bc_bin_table, expect_id_barcode_file]
+                        cmd_args = ['python3', resolve_script('correct_BCtag.py'), raw_bam, fixed_bam_umi, fixed_bam_int, bc_bin_table, expect_id_barcode_file]
 
-                        correct_processes.append(subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                        correct_processes.append(subprocess.Popen(cmd_args, stdout=run_log, stderr=subprocess.STDOUT, env=exec_env))
 
                     for p in correct_processes:
-                        _, stderr = p.communicate()
+                        p.wait()
                         if p.returncode != 0:
-                            raise RuntimeError(f"correct_BCtag failed (rc={p.returncode}): {stderr.strip()}")
+                            raise RuntimeError(f"correct_BCtag failed (rc={p.returncode}). Check {log_path} for details.")
                             
                     print(">>> Skipping physical merge of chunks (will stream to STAR)...")
                     
@@ -502,9 +537,9 @@ def run_pipeline_stages(yaml_file):
                     if os.path.exists(legacy_int):
                         int_arg = legacy_int
 
-                map_cmd = ['python3', f'{zumis_dir}/mapping_analysis.py', yaml_file, '--umi_bam', umi_arg, '--internal_bam', int_arg]
+                map_cmd = ['python3', resolve_script('mapping_analysis.py'), yaml_file, '--umi_bam', umi_arg, '--internal_bam', int_arg]
                 run_stage_cmd(map_cmd, "mapping_analysis.py")
-                
+                                
                 # Cleanup chunks after successful mapping
                 if 'umi_chunks' in locals() and umi_chunks:
                      print(">>> Cleaning up UMI chunks...")
@@ -523,68 +558,23 @@ def run_pipeline_stages(yaml_file):
                 umi_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.umi.Aligned.out.bam")
                 int_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.internal.Aligned.out.bam")
                 
-                featurecounts_cmd = ['python3', f'{zumis_dir}/run_featurecounts.py', yaml_file, '--umi_bam', umi_aligned, '--internal_bam', int_aligned]
+                featurecounts_cmd = ['python3', resolve_script('run_featurecounts.py'), yaml_file, '--umi_bam', umi_aligned, '--internal_bam', int_aligned]
                 run_stage_cmd(featurecounts_cmd, "FeatureCounts (Python)")
 
                 print(">>> Starting DGE Analysis (Python)")
-                dge_cmd = ['python3', f'{zumis_dir}/dge_analysis.py', yaml_file, samtools]
+                dge_cmd = ['python3', resolve_script('dge_analysis.py'), yaml_file, samtools]
                 run_stage_cmd(dge_cmd, "dge_analysis.py")
 
             if which_stage in ["Filtering", "Mapping", "Counting", "Summarising"]:
                 # Force stats to run by default if not explicitly disabled
                 if str(config.get('make_stats', 'yes')).lower() in ['yes', 'true']:
                     print(">>> Starting Statistics Stage")
-                    stats_cmd = ['python3', f'{zumis_dir}/generate_stats.py', yaml_file]
+                    stats_cmd = ['python3', resolve_script('generate_stats.py'), yaml_file]
                     run_stage_cmd(stats_cmd, "Stats (Python)")
 
             print("Pipeline Finished Successfully.")
         finally:
             sys.stdout = original_stdout
-
-
-def run_create_reports(data):
-    sample_name = data['project']
-    sample_species = data['sample']['sample_species'].upper()
-    script_path = data['zUMIs_directory']
-    result_dir = data['out_dir']
-
-    summary_script = f'{script_path}/report/create_summary'
-    if not os.path.exists(summary_script):
-        print(f"Warning: Summary script not found at {summary_script}. Skipping report generation.")
-        # Try to copy stats PDF if available even if report generation is skipped
-        pdf_source = f'{result_dir}/analysis/zUMIs_output/stats/{sample_name}.features.pdf'
-        if os.path.exists(pdf_source):
-             shutil.copy(pdf_source, f'{result_dir}/results/{sample_name}.features.pdf')
-        return
-
-    if sample_species == 'HUMAN':
-        sample_species = 'Human'
-    else:
-        sample_species = 'Mouse'
-    
-    cmd = [
-        f'{script_path}/report/create_summary',
-        '--sample', str(sample_name),
-        '--indir', f'{result_dir}/analysis',
-        '--species', str(sample_species),
-        '--well', f'{result_dir}/config/expect_id_barcode.tsv',
-    ]
-    with open(f'{result_dir}/analysis/report_run.log','w') as run_log, open(f'{result_dir}/analysis/report_run_error.log','w') as error_log:
-        process_status = subprocess.run(cmd, stdout=run_log, stderr=error_log, text=True)
-
-    returncode = process_status.returncode
-    if int(returncode) != 0:
-        raise Exception(f'Error happen when cerate reports, see {result_dir}/analysis/report_run_error.log for detail.')
-    
-    shutil.copytree(f'{result_dir}/analysis/summary/div', f'{result_dir}/results/html')
-    shutil.copy(f'{result_dir}/analysis/summary/{sample_name}_stat.xls', f'{result_dir}/results/{sample_name}_stat.xls')
-    
-    pdf_source = f'{result_dir}/analysis/zUMIs_output/stats/{sample_name}.features.pdf'
-    if os.path.exists(pdf_source):
-        shutil.copy(pdf_source, f'{result_dir}/results/{sample_name}.features.pdf')
-    else:
-        print(f"Warning: Features PDF not found at {pdf_source}, skipping copy.")
-
 
 def get_args():
     parser = argparse.ArgumentParser(description='MGIEasy high sensitive full length transcriptome data analysis pipeline.')
@@ -630,10 +620,6 @@ def main():
     run_pipeline_stages(final_config_path)
     
     print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} Finish run zUMIs Pipeline.', flush=True)
-
-    print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} Start create results.', flush=True)
-    run_create_reports(data)
-    print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} Finish create results.', flush=True)
 
     print('All analysis finish, bye.')
 

@@ -88,10 +88,7 @@ make_stats: yes
 which_Stage: Filtering
 
 #define dependencies program paths
-samtools_exec: samtools 
-Rscript_exec: Rscript 
-STAR_exec: STAR 
-pigz_exec: pigz 
+#Tools are automatically resolved from <zUMIs_directory>/software on Linux.
 zUMIs_directory: path to zUMIs # must be set as the path for zUMIs provided by this repository
 
 #below, fqfilter will add a read_layout flag defining SE or PE
