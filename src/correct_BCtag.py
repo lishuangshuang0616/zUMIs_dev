@@ -100,14 +100,13 @@ def main():
             print(f"Processed {processed} reads...", flush=True)
 
         try:
-            try:
+            raw_bc = None
+            if read.has_tag("CR"):
                 raw_bc = read.get_tag("CR")
                 if isinstance(raw_bc, str):
                     raw_bc = raw_bc.upper()
                 else:
                     raw_bc = None
-            except KeyError:
-                raw_bc = None
             
             # If no barcode, where should it go? Usually discard or put in one.
             # Assuming discard if critical tags missing, but here we just write to UMI default or skip?
@@ -144,8 +143,15 @@ def main():
                 # ---------- Internal read ----------
                 else:
                     try:
-                        ub = read.get_tag("UR")
-                        qu = read.get_tag("UY")
+                        if read.has_tag("UR"):
+                            ub = read.get_tag("UR")
+                        else:
+                            ub = None
+                        
+                        if read.has_tag("UY"):
+                            qu = read.get_tag("UY")
+                        else:
+                            qu = None
                     except KeyError:
                         ub, qu = None, None
 

@@ -257,6 +257,7 @@ def modify_yaml(data, fq1_names, fq2_names):
 
     new_data['samtools_exec'] = resolve_tool('samtools', 'samtools_exec')
     new_data['pigz_exec'] = resolve_tool('pigz', 'pigz_exec')
+    new_data['seqkit_exec'] = resolve_tool('seqkit', 'seqkit_exec')
     new_data['STAR_exec'] = resolve_tool('STAR', 'STAR_exec')
     new_data['featureCounts_exec'] = resolve_tool('featureCounts', 'featureCounts_exec')
     
@@ -319,6 +320,7 @@ def run_pipeline_stages(yaml_file):
     # Executables
     samtools = config.get('samtools_exec', 'samtools')
     pigz = config.get('pigz_exec', 'pigz')
+    seqkit = config.get('seqkit_exec', 'seqkit')
     zumis_dir = config.get('zUMIs_directory', '.')
 
     exec_env = os.environ.copy()
@@ -434,20 +436,18 @@ def run_pipeline_stages(yaml_file):
                 pool = multiprocessing.Pool(processes=min(2, num_threads)) 
                 results = []
                 
-                # R1
-                res1 = pool.apply_async(
-                    pipeline_modules.split_fastq,
-                    (fq1_files, num_threads, lines_per_chunk, tmp_merge_dir, project, pigz),
-                )
-                results.append(res1)
-                
-                # R2
                 if fq2_files:
-                    res2 = pool.apply_async(
+                    res = pool.apply_async(
                         pipeline_modules.split_fastq,
-                        (fq2_files, num_threads, lines_per_chunk, tmp_merge_dir, project, pigz),
+                        (fq1_files, num_threads, lines_per_chunk, tmp_merge_dir, project, pigz, seqkit, fq2_files),
                     )
-                    results.append(res2)
+                    results.append(res)
+                else:
+                    res = pool.apply_async(
+                        pipeline_modules.split_fastq,
+                        (fq1_files, num_threads, lines_per_chunk, tmp_merge_dir, project, pigz, seqkit),
+                    )
+                    results.append(res)
 
                 pool.close()
                 pool.join()
@@ -473,6 +473,26 @@ def run_pipeline_stages(yaml_file):
                     if p.returncode != 0:
                         raise RuntimeError(f"fqfilter failed (rc={p.returncode}). Check {log_path} for details.")
 
+                print(">>> Cleaning up temporary FASTQ chunks...")
+                import glob
+                cleanup_candidates = (
+                    glob.glob(os.path.join(tmp_merge_dir, "*.part_*"))
+                    + glob.glob(os.path.join(tmp_merge_dir, "*.part_*.gz"))
+                    + glob.glob(os.path.join(tmp_merge_dir, "*.fq.part_*"))
+                    + glob.glob(os.path.join(tmp_merge_dir, "*.fq.part_*.gz"))
+                    + glob.glob(os.path.join(tmp_merge_dir, "*.fastq.part_*"))
+                    + glob.glob(os.path.join(tmp_merge_dir, "*.fastq.part_*.gz"))
+                )
+                for f in cleanup_candidates:
+                    if not os.path.exists(f):
+                        continue
+                    base = os.path.basename(f)
+                    if base.endswith(".bam") or base.endswith(".bai") or base.endswith(".txt"):
+                        continue
+                    if ".raw.tagged." in base or ".filtered.tagged." in base:
+                        continue
+                    os.remove(f)
+
                 print(">>> Merging BAM Stats")
                 pipeline_modules.merge_bam_stats(tmp_merge_dir, project, out_dir, yaml_file, samtools)
 
@@ -490,10 +510,10 @@ def run_pipeline_stages(yaml_file):
                     int_chunks = []
 
                     for suffix in chunk_suffixes:
-                        raw_bam = os.path.join(tmp_merge_dir, f"{project}.{suffix}.raw.tagged.bam")
+                        raw_bam = os.path.join(tmp_merge_dir, f"{project}{suffix}.raw.tagged.bam")
                         # Output files
-                        fixed_bam_umi = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.umi.bam")
-                        fixed_bam_int = os.path.join(tmp_merge_dir, f"{project}.{suffix}.filtered.tagged.internal.bam")
+                        fixed_bam_umi = os.path.join(tmp_merge_dir, f"{project}{suffix}.filtered.tagged.umi.bam")
+                        fixed_bam_int = os.path.join(tmp_merge_dir, f"{project}{suffix}.filtered.tagged.internal.bam")
                         
                         umi_chunks.append(fixed_bam_umi)
                         int_chunks.append(fixed_bam_int)
@@ -510,6 +530,11 @@ def run_pipeline_stages(yaml_file):
                         p.wait()
                         if p.returncode != 0:
                             raise RuntimeError(f"correct_BCtag failed (rc={p.returncode}). Check {log_path} for details.")
+
+                    for suffix in chunk_suffixes:
+                        raw_bam = os.path.join(tmp_merge_dir, f"{project}{suffix}.raw.tagged.bam")
+                        if os.path.exists(raw_bam):
+                            os.remove(raw_bam)
                             
                     print(">>> Skipping physical merge of chunks (will stream to STAR)...")
                     

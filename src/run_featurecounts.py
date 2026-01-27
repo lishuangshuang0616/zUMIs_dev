@@ -176,10 +176,126 @@ def merge_exon_intron_bams(bam_ex, bam_in, out_bam, samtools_exec, threads=4, ge
     Adds RE:Z:E/N/I tag.
     Adds GN:Z:GeneName tag based on GX tag and gene_map.
     Adds SR:Z:Source tag (UMI/Internal) if provided.
-    Input BAMs are ASSUMED to be sorted by name (output from featureCounts on name-sorted input).
+    Input BAMs are ASSUMED to be sorted by name.
     """
     print(f"Merging Exon and Intron BAMs into {out_bam} (Source: {source_label})...")
     
+    # Try using pysam first for speed
+    try:
+        import pysam
+        print("Using pysam for BAM merging...")
+        
+        # We need name-sorted inputs. Check if we need to sort them first.
+        # pysam doesn't easily check sort order without reading, but we can assume inputs from featureCounts 
+        # (which outputs name-sorted if configured, but here we run featureCounts with -R BAM which outputs coordinate sorted usually unless -s is used? 
+        # Actually featureCounts -R BAM output order depends on input. If input was name sorted, output is name sorted.
+        # But to be safe, we sort them to temporary files.
+        
+        bam_ex_sorted = bam_ex + ".nsort.bam"
+        bam_in_sorted = bam_in + ".nsort.bam"
+        
+        # Sort inputs by name using samtools (faster than pysam sort usually due to threads)
+        # Using 1/2 threads for each sort
+        sort_threads = max(1, int(threads) // 2)
+        
+        p1 = subprocess.Popen([samtools_exec, 'sort', '-n', '-@', str(sort_threads), '-o', bam_ex_sorted, bam_ex])
+        p2 = subprocess.Popen([samtools_exec, 'sort', '-n', '-@', str(sort_threads), '-o', bam_in_sorted, bam_in])
+        
+        p1.wait()
+        p2.wait()
+        
+        if p1.returncode != 0 or p2.returncode != 0:
+            raise RuntimeError("Sorting failed")
+
+        with pysam.AlignmentFile(bam_ex_sorted, "rb") as f_ex, \
+             pysam.AlignmentFile(bam_in_sorted, "rb") as f_in, \
+             pysam.AlignmentFile(out_bam, "wb", template=f_ex, threads=int(threads)) as f_out:
+            
+            # Generators
+            iter_ex = f_ex.fetch(until_eof=True)
+            iter_in = f_in.fetch(until_eof=True)
+            
+            count = 0
+            
+            for read_ex, read_in in zip(iter_ex, iter_in):
+                count += 1
+                if count % 1000000 == 0: print(f"Merged {count} reads...", end='\r')
+                
+                if read_ex.query_name != read_in.query_name:
+                     raise ValueError(f"Read ID mismatch at index {count}: Exon='{read_ex.query_name}' vs Intron='{read_in.query_name}'")
+                
+                final_read = None
+                
+                # Logic: Check assignments
+                # XT tag denotes assignment in featureCounts
+                
+                if read_ex.has_tag('XT'):
+                    final_read = read_ex
+                    final_read.set_tag('RE', 'E')
+                    # Replace XT with GX for consistency with downstream tools if needed, 
+                    # but typically we keep XT or extract GeneID.
+                    # The original code did: replace('XT:Z:', 'GX:Z:')
+                    # So we should add GX tag with the value of XT
+                    val = final_read.get_tag('XT')
+                    final_read.set_tag('GX', val)
+                    # final_read.set_tag('XT', None) # Optional: remove XT if duplicate
+                    
+                elif read_in.has_tag('XT'):
+                    final_read = read_in
+                    final_read.set_tag('RE', 'N') # Intron
+                    val = final_read.get_tag('XT')
+                    final_read.set_tag('GX', val)
+                    
+                else:
+                    # Unassigned in both
+                    # Check XS in Exon read for reason
+                    final_read = read_ex
+                    
+                    status = "Unassigned"
+                    if final_read.has_tag('XS'):
+                        xs_val = final_read.get_tag('XS')
+                        if "Unassigned_" in xs_val:
+                            status = xs_val.replace("Unassigned_", "")
+                        elif xs_val == "Assigned": 
+                             # Should have been caught by XT check, but just in case
+                             pass
+                    
+                    if status == "NoFeatures":
+                         final_read.set_tag('RE', 'I') # Intergenic
+                    elif final_read.is_unmapped:
+                         pass # No RE tag
+                    else:
+                         # Mapped but ambiguous/multimapping etc
+                         pass
+                
+                # Add Source Label
+                if source_label:
+                    final_read.set_tag('SR', source_label)
+                
+                # Add Gene Name (GN)
+                if final_read.has_tag('GX'):
+                    g_id = final_read.get_tag('GX')
+                    if gene_map:
+                        g_name = gene_map.get(g_id, g_id)
+                        final_read.set_tag('GN', g_name)
+                
+                f_out.write(final_read)
+                
+        # Cleanup sorted tmp files
+        os.remove(bam_ex_sorted)
+        os.remove(bam_in_sorted)
+        print("\nMerge complete (via pysam).")
+        return
+
+    except ImportError:
+        print("pysam not found. Falling back to samtools pipe method...")
+    except Exception as e:
+        print(f"pysam merge failed: {e}. Falling back to samtools pipe method...")
+        # Cleanup potentially created files
+        if 'bam_ex_sorted' in locals() and os.path.exists(bam_ex_sorted): os.remove(bam_ex_sorted)
+        if 'bam_in_sorted' in locals() and os.path.exists(bam_in_sorted): os.remove(bam_in_sorted)
+
+    # Fallback to original implementation
     sort_threads = max(1, int(threads) // 2)
     buf_size = 64 * 1024 * 1024
     

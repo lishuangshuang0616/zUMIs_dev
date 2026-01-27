@@ -61,10 +61,16 @@ def extract_seq(seq, qual, definition, ss3_no_pattern=False):
         
     return bc_seq, bc_qual, umi_seq, umi_qual, cdna_seq, cdna_qual
 
-def hamming_distance(s1, s2):
+def hamming_distance(s1, s2, limit=None):
     if len(s1) != len(s2):
         return len(s1)
-    return sum(el1 != el2 for el1, el2 in zip(s1, s2))
+    dist = 0
+    for c1, c2 in zip(s1, s2):
+        if c1 != c2:
+            dist += 1
+            if limit is not None and dist > limit:
+                return dist
+    return dist
 
 def fastq_iter(handle):
     while True:
@@ -167,8 +173,8 @@ def main():
     else:
         umi_filter = list(map(int, str(config['filter_cutoffs']['UMI_filter']).split()))
     
-    out_bam = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{project}.{tmp_prefix}.raw.tagged.bam")
-    out_bc_stats = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{project}.{tmp_prefix}.BCstats.txt")
+    out_bam = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{project}{tmp_prefix}.raw.tagged.bam")
+    out_bc_stats = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{project}{tmp_prefix}.BCstats.txt")
 
     pigz_procs = []
     handles = []
@@ -176,11 +182,31 @@ def main():
         base_name = os.path.basename(f)
         if base_name.endswith('.gz'):
             base_name = base_name[:-3]
-        chunk_path = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{base_name}{tmp_prefix}.gz")
-
-        p = subprocess.Popen([pigz, '-p', '2', '-dc', chunk_path], stdout=subprocess.PIPE, text=False, bufsize=1024*1024)
-        pigz_procs.append(p)
-        handles.append(p.stdout)
+        if base_name.endswith('.fastq'):
+            base_name = base_name[:-6]
+        elif base_name.endswith('.fq'):
+            base_name = base_name[:-3]
+            
+        # Try finding the file with .gz extension first (default behavior)
+        chunk_path_gz = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{base_name}{tmp_prefix}.gz")
+        chunk_path_plain = os.path.join(out_dir, "zUMIs_output/.tmpMerge", f"{base_name}{tmp_prefix}")
+        
+        # Determine which file to use
+        if os.path.exists(chunk_path_gz):
+            p = subprocess.Popen([pigz, '-p', '2', '-dc', chunk_path_gz], stdout=subprocess.PIPE, text=False, bufsize=1024*1024)
+            pigz_procs.append(p)
+            handles.append(p.stdout)
+        elif os.path.exists(chunk_path_plain):
+             # Uncompressed file: open directly
+             p = open(chunk_path_plain, 'rb')
+             handles.append(p)
+             # No process to wait for, but we need to match the cleanup logic
+             # We'll just not add anything to pigz_procs
+        else:
+             # Fallback or error: try expecting the prefix included the extension?
+             # For now assume failure if neither exists, but let the original logic fail or print error
+             sys.stderr.write(f"Error: Chunk file not found: {chunk_path_gz} or {chunk_path_plain}\n")
+             sys.exit(1)
 
     iters = [fastq_iter(h) for h in handles]
     
@@ -225,7 +251,7 @@ def main():
                 if pat is not None:
                     pat_seq, mm = pat
                     if pat_seq == b"ATTGCGCAATG":
-                        if hamming_distance(seq[:len(pat_seq)], pat_seq) <= mm:
+                        if hamming_distance(seq[:len(pat_seq)], pat_seq, limit=mm) <= mm:
                             ss3_status = "yespattern"
                         else:
                             ss3_status = "nopattern"
@@ -253,8 +279,16 @@ def main():
 
             # Quality filtering
             def check_qual(q_str, threshold_count, threshold_val):
-                low_quals = sum(1 for q in q_str if (q - 33) < threshold_val)
-                return low_quals < threshold_count
+                # Optimize: fail fast
+                # (q - 33) < threshold_val  =>  q < threshold_val + 33
+                limit = threshold_val + 33
+                low_quals = 0
+                for q in q_str:
+                    if q < limit:
+                        low_quals += 1
+                        if low_quals >= threshold_count:
+                            return False
+                return True
 
             if not check_qual(final_bc_q, bc_filter[0], bc_filter[1]):
                 continue

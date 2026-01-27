@@ -285,9 +285,12 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
             is_kept = bc in kept_barcodes
             is_read1 = read.is_read1
             
-            # Fetch tags once
-            tags = dict(read.get_tags())
-            source = tags.get('SR')
+            # Fetch tags once (Optimized)
+            # Avoid full dict conversion: tags = dict(read.get_tags())
+            # We only need SR, RE, GX, XS
+            
+            source = None
+            if read.has_tag('SR'): source = read.get_tag('SR')
             
             if is_kept:
                 if is_read1:
@@ -297,22 +300,23 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                         stats[bc]['Internal_Reads'] += 1
                 
                 category = "Intergenic"
-                if 'RE' in tags:
-                    re_val = tags['RE']
+                # Check RE > GX > XS > Unmapped
+                if read.has_tag('RE'):
+                    re_val = read.get_tag('RE')
                     if re_val == 'E': category = 'Exon'
                     elif re_val == 'N': category = 'Intron'
                     elif re_val == 'I': category = 'Intergenic'
                     else: category = re_val
+                elif read.has_tag('GX'):
+                    category = "Exon"
+                elif read.has_tag('XS'):
+                    status = read.get_tag('XS')
+                    if status.startswith("Unassigned_"):
+                        status = status.replace("Unassigned_", "")
+                    if status == "NoFeatures": category = "Intergenic"
+                    else: category = status
                 else:
-                    if 'GX' in tags: category = "Exon"
-                    elif 'XS' in tags:
-                        status = tags['XS']
-                        if status.startswith("Unassigned_"):
-                            status = status.replace("Unassigned_", "")
-                        if status == "NoFeatures": category = "Intergenic"
-                        else: category = status
-                    else:
-                        if read.is_unmapped: category = "Unmapped"
+                    if read.is_unmapped: category = "Unmapped"
                 
                 if is_read1:
                     stats[bc][category] += 1
@@ -321,7 +325,8 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                     stats["__NO_CB__"]["Unused BC"] += 1
             
             # --- 2. Coverage Calculation (Downsampled independently) ---
-            if is_kept and 'GX' in tags and source in ['UMI', 'Internal']:
+            # Check GX presence efficiently
+            if is_kept and source in ['UMI', 'Internal'] and read.has_tag('GX'):
                 # Determine if we should process this read based on its type count
                 process_coverage = False
                 if source == 'UMI':
@@ -332,7 +337,7 @@ def parse_bam_stats(bam_file, samtools_exec, kept_barcodes, gene_models):
                         process_coverage = True
                 
                 if process_coverage:
-                    gene_id = tags['GX']
+                    gene_id = read.get_tag('GX')
                     model = gene_models.get(gene_id)
                     
                     if model:
@@ -727,7 +732,11 @@ def main():
     
     # --- 3. Calculate Mapping Stats (Reads) & Coverage ---
     gtf_file = os.path.join(out_dir, f"{project}.final_annot.gtf")
-    gene_models = load_gene_percentiles(gtf_file)
+    if not os.path.exists(gtf_file):
+         # Fallback to user provided GTF
+         gtf_file = config['reference']['GTF_file']
+    
+    gene_models = load_gene_models(gtf_file)
     
     bam_file = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
     read_stats = collections.defaultdict(lambda: collections.defaultdict(int))

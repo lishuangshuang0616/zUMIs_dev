@@ -93,14 +93,13 @@ def main():
             try:
                 for read in infile:
                     try:
-                        try:
+                        raw_bc = None
+                        if read.has_tag("CR"):
                             raw_bc = read.get_tag("CR")
                             if isinstance(raw_bc, str):
                                 raw_bc = raw_bc.upper()
                             else:
                                 raw_bc = None
-                        except KeyError:
-                            raw_bc = None
                         
                         # If no barcode, default to UMI stream?
                         if not raw_bc:
@@ -131,8 +130,15 @@ def main():
                                     read.query_qualities = new_qual
                             else:
                                 try:
-                                    ub = read.get_tag("UR")
-                                    qu = read.get_tag("UY")
+                                    if read.has_tag("UR"):
+                                        ub = read.get_tag("UR")
+                                    else:
+                                        ub = None
+                                    
+                                    if read.has_tag("UY"):
+                                        qu = read.get_tag("UY")
+                                    else:
+                                        qu = None
                                 except KeyError:
                                     ub, qu = None, None
                                 if ub:

@@ -11,6 +11,7 @@ import scipy.io
 import scipy.sparse
 import numpy as np
 import pandas as pd
+import multiprocessing
 
 try:
     import pysam
@@ -96,6 +97,52 @@ def cluster_umis(umis, threshold=1):
                 visited.add(child)
 
     return parent_map
+
+def process_barcode_worker(args):
+    """
+    Worker function for parallel UMI clustering.
+    Args:
+        args: tuple (bc, umis_exon_map, umis_intron_map, ham_dist)
+    Returns:
+        bc, res_umi_counts_exon, res_umi_counts_intron, res_umi_counts_inex, res_correction
+    """
+    bc, umis_exon_map, umis_intron_map, ham_dist = args
+    
+    res_umi_counts_exon = {}
+    res_umi_counts_intron = {}
+    res_umi_counts_inex = {}
+    res_correction = {}
+    
+    genes_exon = set(umis_exon_map.keys())
+    genes_intron = set(umis_intron_map.keys())
+    all_genes = genes_exon | genes_intron
+    
+    for gene in all_genes:
+        umis_ex = umis_exon_map.get(gene, [])
+        umis_in = umis_intron_map.get(gene, [])
+        umis_total = umis_ex + umis_in
+        
+        if not umis_total: continue
+        
+        # Cluster
+        mapping = cluster_umis(umis_total, threshold=ham_dist)
+        
+        if ham_dist > 0:
+            res_correction[gene] = mapping
+            
+        # Count
+        unique_total = set([mapping[u] for u in umis_total])
+        res_umi_counts_inex[gene] = len(unique_total)
+        
+        if umis_ex:
+            unique_ex = set([mapping[u] for u in umis_ex])
+            res_umi_counts_exon[gene] = len(unique_ex)
+            
+        if umis_in:
+            unique_in = set([mapping[u] for u in umis_in])
+            res_umi_counts_intron[gene] = len(unique_in)
+            
+    return bc, res_umi_counts_exon, res_umi_counts_intron, res_umi_counts_inex, res_correction
 
 def natural_sort_key(s):
     """
@@ -232,14 +279,22 @@ def write_sparse_matrix(counts_dict, gene_list, gene_names_map, barcode_list, ou
     # Shape is fixed to the full reference lists
     mat = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(len(gene_list), len(barcode_list)))
     
-    matrix_file = os.path.join(full_out_dir, "matrix.mtx")
-    # scipy mmwrite will respect the order of entries in the coo_matrix lists
-    scipy.io.mmwrite(matrix_file, mat)
-    with open(matrix_file, 'rb') as f_in:
-        with gzip.open(matrix_file + ".gz", 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    os.remove(matrix_file)
+    # Optimized: Write directly to gzip stream to avoid temp file I/O
+    matrix_file_gz = os.path.join(full_out_dir, "matrix.mtx.gz")
     
+    # Manually write MatrixMarket format to gzip stream
+    # Header: %%MatrixMarket matrix coordinate integer general
+    # Size: Rows Cols Entries
+    with gzip.open(matrix_file_gz, 'wt') as f:
+        f.write("%%MatrixMarket matrix coordinate integer general\n")
+        f.write("%\n")
+        f.write(f"{mat.shape[0]} {mat.shape[1]} {mat.nnz}\n")
+        
+        # Data: row col val (1-based)
+        # Zip iterators are faster than index access
+        for r, c, d in zip(mat.row, mat.col, mat.data):
+            f.write(f"{r+1} {c+1} {d}\n")
+
     with gzip.open(os.path.join(full_out_dir, "barcodes.tsv.gz"), "wt") as f:
         for bc in barcode_list:
             f.write(f"{bc}\n")
@@ -340,37 +395,43 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             final_read_counts['inex'][bc][gene] += read_counts_raw['intron'][bc][gene]
 
     # Calculate UMI Counts (with Clustering)
-    all_bcs_umis = set(umi_data['exon'].keys()) | set(umi_data['intron'].keys())
+    all_bcs_umis = list(set(umi_data['exon'].keys()) | set(umi_data['intron'].keys()))
     total_bcs = len(all_bcs_umis)
     
-    for i, bc in enumerate(all_bcs_umis):
-        if i % 100 == 0: print(f"Clustering Barcode {i}/{total_bcs}...", end='\r')
+    print(f"Clustering UMIs for {total_bcs} barcodes using {threads} threads...")
+    
+    pool_args = []
+    for bc in all_bcs_umis:
+        pool_args.append((bc, umi_data['exon'][bc], umi_data['intron'][bc], ham_dist))
         
-        genes_exon = set(umi_data['exon'].get(bc, {}).keys())
-        genes_intron = set(umi_data['intron'].get(bc, {}).keys())
-        all_genes = genes_exon | genes_intron
-        
-        for gene in all_genes:
-            umis_ex = umi_data['exon'].get(bc, {}).get(gene, [])
-            umis_in = umi_data['intron'].get(bc, {}).get(gene, [])
-            umis_total = umis_ex + umis_in
-            if not umis_total: continue
+    if threads > 1:
+        # Parallel Processing
+        with multiprocessing.Pool(threads) as pool:
+            # imap_unordered yields results as they complete
+            for i, res in enumerate(pool.imap_unordered(process_barcode_worker, pool_args, chunksize=20)):
+                if i % 100 == 0: 
+                    print(f"Clustering Barcode {i}/{total_bcs}...", end='\r')
+                
+                bc, c_ex, c_in, c_inex, corr = res
+                
+                if c_ex: final_umi_counts['exon'][bc].update(c_ex)
+                if c_in: final_umi_counts['intron'][bc].update(c_in)
+                if c_inex: final_umi_counts['inex'][bc].update(c_inex)
+                if corr:
+                    correction_map[bc].update(corr)
+    else:
+        # Serial Processing
+        for i, args in enumerate(pool_args):
+            if i % 100 == 0: 
+                print(f"Clustering Barcode {i}/{total_bcs}...", end='\r')
             
-            mapping = cluster_umis(umis_total, threshold=ham_dist)
-            if ham_dist > 0:
-                correction_map[bc][gene] = mapping
+            bc, c_ex, c_in, c_inex, corr = process_barcode_worker(args)
             
-            # Count Unique Corrected UMIs
-            unique_total = set([mapping[u] for u in umis_total])
-            final_umi_counts['inex'][bc][gene] = len(unique_total)
-            
-            if umis_ex:
-                unique_ex = set([mapping[u] for u in umis_ex])
-                final_umi_counts['exon'][bc][gene] = len(unique_ex)
-            
-            if umis_in:
-                unique_in = set([mapping[u] for u in umis_in])
-                final_umi_counts['intron'][bc][gene] = len(unique_in)
+            if c_ex: final_umi_counts['exon'][bc].update(c_ex)
+            if c_in: final_umi_counts['intron'][bc].update(c_in)
+            if c_inex: final_umi_counts['inex'][bc].update(c_inex)
+            if corr:
+                correction_map[bc].update(corr)
 
     print("\nWriting Matrices...")
     
@@ -407,7 +468,7 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             # Open a pysam writer pointing to the sort process's stdin
             # We use "wb" mode and pass the process's stdin as the file
             # template=infile ensures header is copied
-            with pysam.AlignmentFile(sort_process.stdin, "wb", template=infile) as outfile:
+            with pysam.AlignmentFile(sort_process.stdin, "wb", template=infile, threads=threads) as outfile:
                 for read in infile:
                     # Process UMI tags if UR exists
                     if read.has_tag("UR"):
@@ -421,9 +482,17 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
                             final_umi = raw_umi
                             # Apply correction
                             if ham_dist > 0:
-                                if bc in correction_map and gene in correction_map[bc]:
-                                    if raw_umi in correction_map[bc][gene]:
-                                        final_umi = correction_map[bc][gene][raw_umi]
+                                # Safe dictionary lookup without explicit existence check
+                                # correction_map is defaultdict(lambda: defaultdict(dict))
+                                # Using .get() on standard dicts is safer, but for defaultdict we must be careful
+                                # Accessing correction_map[bc] creates it if missing, which is bad for memory if bc is junk.
+                                # Use get() on the defaultdict itself to avoid creation.
+                                bc_map = correction_map.get(bc)
+                                if bc_map:
+                                    gene_map = bc_map.get(gene)
+                                    if gene_map:
+                                        # Use get() for final lookup, default to raw_umi
+                                        final_umi = gene_map.get(raw_umi, raw_umi)
                             
                             read.set_tag("UB", final_umi)
                         else:
