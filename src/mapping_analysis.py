@@ -206,7 +206,7 @@ def main():
     # Base params (Common)
     # Important: readFilesType SAM because our corrector outputs uncompressed BAM (which STAR treats as SAM/BAM stream)
     # STAR auto-detects BAM vs SAM if we say SAM usually, or we can use BAM Unsorted
-    misc_base = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {num_threads} --sjdbOverhang {read_len-1} --readFilesType SAM {read_layout} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --quantMode TranscriptomeSAM --limitOutSJcollapsed 5000000"
+    misc_base = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {num_threads} --sjdbOverhang {read_len-1} --readFilesType SAM {read_layout} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --limitOutSJcollapsed 5000000"
     
     extra_params = config['reference'].get('additional_STAR_params', '') or ""
     

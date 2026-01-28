@@ -393,6 +393,15 @@ def run_pipeline_stages(yaml_file):
                         pass
                     raise RuntimeError(f"{stage_name} failed with exit code {res.returncode}.")
 
+            def remove_path(path):
+                if not path:
+                    return
+                if os.path.exists(path):
+                    os.remove(path)
+                bai = path + ".bai"
+                if os.path.exists(bai):
+                    os.remove(bai)
+
             if which_stage == "Filtering":
                 print(">>> Starting Filtering Stage")
                 
@@ -582,13 +591,25 @@ def run_pipeline_stages(yaml_file):
                 # Updated to pass aligned BAMs (names determined by mapping_analysis output)
                 umi_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.umi.Aligned.out.bam")
                 int_aligned = os.path.join(out_dir, f"{project}.filtered.tagged.internal.Aligned.out.bam")
+                umi_to_tx = os.path.join(out_dir, f"{project}.filtered.tagged.umi.Aligned.toTranscriptome.out.bam")
+                int_to_tx = os.path.join(out_dir, f"{project}.filtered.tagged.internal.Aligned.toTranscriptome.out.bam")
                 
                 featurecounts_cmd = ['python3', resolve_script('run_featurecounts.py'), yaml_file, '--umi_bam', umi_aligned, '--internal_bam', int_aligned]
                 run_stage_cmd(featurecounts_cmd, "FeatureCounts (Python)")
 
+                remove_path(umi_aligned)
+                remove_path(int_aligned)
+                remove_path(umi_to_tx)
+                remove_path(int_to_tx)
+
                 print(">>> Starting DGE Analysis (Python)")
                 dge_cmd = ['python3', resolve_script('dge_analysis.py'), yaml_file, samtools]
                 run_stage_cmd(dge_cmd, "dge_analysis.py")
+
+                gene_tagged_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
+                stats_enabled = str(config.get('make_stats', 'yes')).lower() in ['yes', 'true']
+                if not stats_enabled:
+                    remove_path(gene_tagged_bam)
 
             if which_stage in ["Filtering", "Mapping", "Counting", "Summarising"]:
                 # Force stats to run by default if not explicitly disabled
@@ -596,6 +617,8 @@ def run_pipeline_stages(yaml_file):
                     print(">>> Starting Statistics Stage")
                     stats_cmd = ['python3', resolve_script('generate_stats.py'), yaml_file]
                     run_stage_cmd(stats_cmd, "Stats (Python)")
+                    gene_tagged_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
+                    remove_path(gene_tagged_bam)
 
             print("Pipeline Finished Successfully.")
         finally:
