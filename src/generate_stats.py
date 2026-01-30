@@ -33,19 +33,25 @@ def load_config(yaml_file):
 
 def load_barcode_mapping(out_dir, project):
     mapping = {}
-    config_dir = os.path.join(os.path.dirname(out_dir.rstrip('/')), "config")
-    expect_file = os.path.join(config_dir, "expect_id_barcode.tsv")
+    expect_candidates = [
+        os.path.join(out_dir, "config", "expect_id_barcode.tsv"),
+        os.path.join(out_dir, "expect_id_barcode.tsv"),
+        os.path.join(os.path.dirname(out_dir.rstrip('/')), "config", "expect_id_barcode.tsv"),
+    ]
+    expect_file = next((p for p in expect_candidates if os.path.exists(p)), None)
     
-    if os.path.exists(expect_file):
-        with open(expect_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 3:
-                    if parts[0] in ['wellID', 'WellID']: continue
-                    well = parts[0].strip()
-                    umi_bc = parts[1].strip()
-                    int_bc = parts[2].strip()
-                    mapping[well] = {'umi': umi_bc, 'int': int_bc}
+    if not expect_file:
+        return mapping
+
+    with open(expect_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 3:
+                if parts[0] in ['wellID', 'WellID']: continue
+                well = parts[0].strip()
+                umi_bc = parts[1].strip()
+                int_bc = parts[2].strip()
+                mapping[well] = {'umi': umi_bc, 'int': int_bc}
     return mapping
 
 def calculate_matrix_stats(matrix_dir):
@@ -210,7 +216,7 @@ def plot_features(read_stats, wells, out_pdf):
     unused_frac = unused_total / total_sum if total_sum > 0 else 0.0
 
     bar_categories = [c for c in categories_order if totals.get(c, 0) > 0]
-    box_categories = [c for c in categories_order if any(v > 0 for v in per_cell_frac[c])]
+    box_categories = [c for c in categories_order if len(per_cell_frac[c]) > 0]
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), gridspec_kw={"height_ratios": [0.6, 1.0]})
 
@@ -229,10 +235,22 @@ def plot_features(read_stats, wells, out_pdf):
     axes[0].set_title("Total Read Distribution")
     axes[0].legend(ncol=max(1, len(bar_categories)+1), loc="upper center", bbox_to_anchor=(0.5, -0.30))
 
-    box_data = [[v * 100.0 for v in per_cell_frac[c]] for c in box_categories]
-    bp = axes[1].boxplot(box_data, labels=box_categories, notch=True, patch_artist=True)
-    for patch, c in zip(bp["boxes"], box_categories):
-        patch.set_facecolor(feat_colors[c])
+    box_pairs = []
+    for c in box_categories:
+        vals = [v * 100.0 for v in per_cell_frac[c]]
+        if len(vals) == 0:
+            continue
+        box_pairs.append((c, vals))
+
+    if not box_pairs or total_sum <= 0:
+        axes[1].axis("off")
+        axes[1].text(0.5, 0.5, "No reads available for per-cell distribution", ha="center", va="center")
+    else:
+        plot_labels = [c for c, _vals in box_pairs]
+        box_data = [_vals for _c, _vals in box_pairs]
+        bp = axes[1].boxplot(box_data, labels=plot_labels, notch=True, patch_artist=True)
+        for patch, c in zip(bp["boxes"], plot_labels):
+            patch.set_facecolor(feat_colors[c])
 
     axes[1].set_title("Reads per Cell")
     axes[1].set_ylabel("% reads/cell")

@@ -134,6 +134,7 @@ def main():
     parser.add_argument('yaml_file')
     parser.add_argument('--umi_bam', required=False, help="Merged UMI Unmapped BAM")
     parser.add_argument('--internal_bam', required=False, help="Merged Internal Unmapped BAM")
+    parser.add_argument('--expect_id_file', required=False, help="Path to expect_id_barcode.tsv")
     args = parser.parse_args()
         
     yaml_file = args.yaml_file
@@ -141,33 +142,42 @@ def main():
     
     project = config['project']
     out_dir = config['out_dir']
-    num_threads = int(config['num_threads'])
+    num_threads = int(config.get('num_threads', 1))
+    
     samtools = config.get('samtools_exec', 'samtools')
     star_exec = config.get('STAR_exec', 'STAR')
     star_index = config['reference']['STAR_index']
     
-    # Inputs from args or fallback
-    umi_bam_input = args.umi_bam
-    internal_bam_input = args.internal_bam
-    
+    # Executables Check
+    if not shutil.which(star_exec) and not os.path.exists(star_exec):
+         print(f"Error: STAR executable not found: {star_exec}")
+         sys.exit(1)
+
+    # 1. Parse Inputs
+    # Support both command line args (comma separated list) and legacy/yaml lookup
     umi_bams = []
+    if args.umi_bam:
+        umi_bams = [x.strip() for x in args.umi_bam.split(',') if x.strip()]
+    
     internal_bams = []
-
-    if umi_bam_input:
-        umi_bams = [f.strip() for f in umi_bam_input.split(',')]
+    if args.internal_bam:
+        internal_bams = [x.strip() for x in args.internal_bam.split(',') if x.strip()]
+        
+    # Explicit expect_id_file argument overrides everything
+    if args.expect_id_file:
+        expect_id_file = args.expect_id_file
     else:
-        # Fallback legacy check
-        default_umi = os.path.join(out_dir, f"{project}.filtered.tagged.umi.unmapped.bam")
-        if os.path.exists(default_umi):
-            umi_bams = [default_umi]
+        # Fallback (legacy logic)
+        barcode_config_path = config['barcodes'].get('barcode_file')
+        if barcode_config_path:
+            config_dir = os.path.dirname(barcode_config_path)
+            expect_id_file = os.path.join(config_dir, "expect_id_barcode.tsv")
+        else:
+            root_dir = os.path.dirname(out_dir.rstrip(os.sep))
+            expect_id_file = os.path.join(root_dir, "config", "expect_id_barcode.tsv")
 
-    if internal_bam_input:
-        internal_bams = [f.strip() for f in internal_bam_input.split(',')]
-    else:
-        # Fallback legacy check
-        default_int = os.path.join(out_dir, f"{project}.filtered.tagged.internal.unmapped.bam")
-        if os.path.exists(default_int):
-            internal_bams = [default_int]
+    if not os.path.exists(expect_id_file):
+        raise FileNotFoundError(f"ID Map file not found: {expect_id_file}")
     
     # Check existence
     for f in umi_bams:
@@ -201,12 +211,12 @@ def main():
     # Define paths for corrector
     corrector_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream_corrector.py")
     bc_bin_file = os.path.join(out_dir, "zUMIs_output", f"{project}.BCbinning.txt")
-    expect_id_file = os.path.join(out_dir, "../config", "expect_id_barcode.tsv")
     
     # Base params (Common)
     # Important: readFilesType SAM because our corrector outputs uncompressed BAM (which STAR treats as SAM/BAM stream)
     # STAR auto-detects BAM vs SAM if we say SAM usually, or we can use BAM Unsorted
-    misc_base = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {num_threads} --sjdbOverhang {read_len-1} --readFilesType SAM {read_layout} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --limitOutSJcollapsed 5000000"
+    # Fix: Set sjdbOverhang to 100 to match typical index generation, avoiding mismatch errors with shorter reads
+    misc_base = f"--genomeDir {star_index} --sjdbGTFfile {final_gtf} --runThreadN {num_threads} --sjdbOverhang {read_len - 1} --readFilesType SAM {read_layout} --outSAMmultNmax 1 --outFilterMultimapNmax 50 --outSAMunmapped Within --outSAMtype BAM Unsorted --limitOutSJcollapsed 5000000"
     
     extra_params = config['reference'].get('additional_STAR_params', '') or ""
     

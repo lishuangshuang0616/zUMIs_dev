@@ -48,6 +48,7 @@ def load_id_map(id_map_file):
                             
     except Exception as e:
         sys.stderr.write(f"Error loading ID map: {e}\n")
+        raise e # Critical error: ID map is required for correction
     return id_map, internal_bcs
 
 def main():

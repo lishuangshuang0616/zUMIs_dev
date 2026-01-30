@@ -269,7 +269,7 @@ def process_bam_and_calculate_stats(input_bam, out_bam, samtools_exec, threads=4
     Adds GN:Z:GeneName tag.
     Calculates Stats on the fly.
     """
-    print(f"Processing BAM {input_bam} -> {out_bam} (Source: {source_label})...")
+    print(f"Processing BAM {input_bam} -> {out_bam} (Source: {source_label}, Threads: {threads})...")
     
     read_stats = collections.defaultdict(lambda: collections.defaultdict(int))
     cov_arr = [0] * 100
@@ -378,7 +378,7 @@ def process_bam_and_calculate_stats(input_bam, out_bam, samtools_exec, threads=4
         print("Using pysam for BAM processing...")
         
         # Input is likely name sorted from featureCounts
-        with pysam.AlignmentFile(input_bam, "rb") as f_in, \
+        with pysam.AlignmentFile(input_bam, "rb", threads=int(threads)) as f_in, \
              pysam.AlignmentFile(out_bam, "wb", template=f_in, threads=int(threads)) as f_out:
             
             count = 0
@@ -447,13 +447,13 @@ def process_bam_and_calculate_stats(input_bam, out_bam, samtools_exec, threads=4
     except Exception as e:
         print(f"pysam processing failed: {e}. Falling back to samtools pipe...")
 
-    # Fallback to samtools pipe (Single Stream)
+    # Fallback to samtools pipe
     buf_size = 64 * 1024 * 1024
     
-    cmd_in = [samtools_exec, 'view', '-h', input_bam]
+    cmd_in = [samtools_exec, 'view', '-h', '-@', str(threads), input_bam]
     proc_in = subprocess.Popen(cmd_in, stdout=subprocess.PIPE, text=True, bufsize=buf_size)
     
-    cmd_out = [samtools_exec, 'view', '-b', '-o', out_bam, '-']
+    cmd_out = [samtools_exec, 'view', '-b', '-@', str(threads), '-o', out_bam, '-']
     proc_out = subprocess.Popen(cmd_out, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=buf_size)
     
     try:
@@ -480,12 +480,6 @@ def process_bam_and_calculate_stats(input_bam, out_bam, samtools_exec, threads=4
                 
                 if "__INTRON__" in xt_val:
                     real_gene = xt_val.split("__INTRON__")[0]
-                    # Replace XT with GX, Add RE:N
-                    # Hacky string replace: Replace full XT tag with GX tag
-                    # Note: This might replace substring if not careful.
-                    # Safest: append tags, ignore XT.
-                    # Or rebuild line.
-                    # Optimized replace:
                     final_line = line.rstrip().replace(f'XT:Z:{xt_val}', f'GX:Z:{real_gene}') + "\tRE:Z:N"
                     category = "Intron"
                 else:
@@ -561,21 +555,15 @@ def split_bam_smartseq3(bam_file, threads, samtools_exec):
     try:
         import pysam
         print("Using pysam for splitting...")
-        # Allocate threads: Main process does reading/splitting. 
-        # Writing compression is handled by bgzf threads.
-        # We give some threads to each writer.
-        write_threads = max(1, int(threads) // 2)
+        read_threads = max(1, int(threads) // 2)
+        write_threads = max(1, int(threads) // 4)
         
-        with pysam.AlignmentFile(bam_file, "rb", threads=max(1, int(threads)//2)) as infile:
+        with pysam.AlignmentFile(bam_file, "rb", threads=read_threads) as infile:
             with pysam.AlignmentFile(umi_bam, "wb", template=infile, threads=write_threads) as out_umi, \
                  pysam.AlignmentFile(internal_bam, "wb", template=infile, threads=write_threads) as out_int:
                 
                 for read in infile:
-                    # Check for UR tag
                     if read.has_tag('UR'):
-                        # Ideally check if not empty, but has_tag usually implies existence.
-                        # zUMIs logic: UB must not be empty. 
-                        # pysam returns value.
                         val = read.get_tag('UR')
                         if val: 
                             out_umi.write(read)
@@ -587,17 +575,13 @@ def split_bam_smartseq3(bam_file, threads, samtools_exec):
     except ImportError:
         pass # Fallback to subprocess
 
-    # Method 2: Subprocess Pipe (One-pass read, Two-pass write)
-    print("pysam not found, using samtools pipe (One-pass)...")
-    
-    # Increase buffer size to 64MB for pipe operations
+    # Method 2: Subprocess Pipe
+    print("pysam not found, using samtools pipe...")
     buf_size = 64 * 1024 * 1024
     
     cmd_in = [samtools_exec, 'view', '-h', '-@', str(max(1, int(threads)//2)), bam_file]
     proc_in = subprocess.Popen(cmd_in, stdout=subprocess.PIPE, text=True, bufsize=buf_size)
     
-    # Use uncompressed output for intermediate files to speed up writing (if disk space allows)
-    # Or keep compressed but optimize level. Default is usually fine.
     cmd_umi = [samtools_exec, 'view', '-b', '-@', str(max(1, int(threads)//4)), '-o', umi_bam, '-']
     proc_umi = subprocess.Popen(cmd_umi, stdin=subprocess.PIPE, text=True, bufsize=buf_size)
     
@@ -611,8 +595,6 @@ def split_bam_smartseq3(bam_file, threads, samtools_exec):
                 proc_int.stdin.write(line)
                 continue
             
-            # Logic: UR tag present and not empty -> UMI, else Internal
-            # 'UR:Z:' indicates presence. 'UR:Z:\t' indicates empty (followed by tab separator).
             if 'UR:Z:' in line and 'UR:Z:\t' not in line:
                 proc_umi.stdin.write(line)
             else:
@@ -625,13 +607,9 @@ def split_bam_smartseq3(bam_file, threads, samtools_exec):
         if proc_in.stdout: proc_in.stdout.close()
         if proc_umi.stdin: proc_umi.stdin.close()
         if proc_int.stdin: proc_int.stdin.close()
-        
         proc_in.wait()
         proc_umi.wait()
         proc_int.wait()
-        
-    if proc_in.returncode != 0 or proc_umi.returncode != 0 or proc_int.returncode != 0:
-        raise RuntimeError("Splitting BAM failed.")
         
     return internal_bam, umi_bam
 
@@ -655,31 +633,24 @@ def main():
     check_dependencies(samtools_exec, featurecounts_exec)
     
     gtf_file = os.path.join(out_dir, f"{project}.final_annot.gtf")
-    
     final_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.bam")
     
     counting_opts = config.get('counting_opts', {})
-    count_introns = counting_opts.get('introns', True)
     
-    print(f"Processing Project: {project}")
+    print(f"Processing Project: {project} with {num_threads} threads.")
     
     umi_bam = args.umi_bam
     internal_bam = args.internal_bam
     
     if not umi_bam or not internal_bam:
-        # Fallback if arguments missing (legacy support or manual run?)
         umi_bam = os.path.join(out_dir, f"{project}.filtered.tagged.umi.Aligned.out.bam")
         internal_bam = os.path.join(out_dir, f"{project}.filtered.tagged.internal.Aligned.out.bam")
         
-    print(f"Input UMI BAM: {umi_bam}")
-    print(f"Input Internal BAM: {internal_bam}")
-
     # Check existence
     if not os.path.exists(umi_bam) and not os.path.exists(internal_bam):
          print("Error: Input BAMs not found.")
          sys.exit(1)
 
-    # Use UMI bam for header check
     header_bam = umi_bam if os.path.exists(umi_bam) else internal_bam
     valid_chroms = get_bam_chromosomes(header_bam, samtools_exec)
     
@@ -689,12 +660,9 @@ def main():
     saf_prefix = os.path.join(saf_dir, f"{project}")
     combined_saf, gene_map = parse_gtf_and_create_saf(gtf_file, saf_prefix, valid_chroms)
     
-    # Load gene models for coverage
     gene_models = load_gene_models(gtf_file)
     
     bams_to_merge = []
-    
-    # Global stats accumulators
     total_read_stats = collections.defaultdict(lambda: collections.defaultdict(int))
     total_cov_umi = [0] * 100
     total_cov_int = [0] * 100
@@ -710,12 +678,10 @@ def main():
     
     # Process Internal (Strand 0)
     if os.path.exists(internal_bam):
-        print("Running featureCounts for Internal Reads (Combined Exon+Intron)...")
+        print("Running featureCounts for Internal Reads...")
         fc_prefix_int = internal_bam + ".fc"
-        # Strand 0 for internal
         fc_out_int = run_featurecounts_cmd(featurecounts_exec, internal_bam, combined_saf, fc_prefix_int, num_threads, 0, "Combined_Internal")
         
-        # Process and Stats
         processed_int = internal_bam + ".processed.bam"
         r_stats, cov = process_bam_and_calculate_stats(
             fc_out_int, processed_int, samtools_exec, num_threads, 
@@ -724,19 +690,15 @@ def main():
         
         merge_stats(total_read_stats, r_stats)
         merge_coverage(total_cov_int, cov)
-        
-        # Cleanup
         os.remove(fc_out_int)
         bams_to_merge.append(processed_int)
 
     # Process UMI (Strand 1)
     if os.path.exists(umi_bam):
-        print("Running featureCounts for UMI Reads (Combined Exon+Intron)...")
+        print("Running featureCounts for UMI Reads...")
         fc_prefix_umi = umi_bam + ".fc"
-        # Strand 1 for UMI
         fc_out_umi = run_featurecounts_cmd(featurecounts_exec, umi_bam, combined_saf, fc_prefix_umi, num_threads, 1, "Combined_UMI")
         
-        # Process and Stats
         processed_umi = umi_bam + ".processed.bam"
         r_stats, cov = process_bam_and_calculate_stats(
             fc_out_umi, processed_umi, samtools_exec, num_threads,
@@ -745,12 +707,10 @@ def main():
         
         merge_stats(total_read_stats, r_stats)
         merge_coverage(total_cov_umi, cov)
-        
-        # Cleanup
         os.remove(fc_out_umi)
         bams_to_merge.append(processed_umi)
 
-    # Save Stats to JSON for generate_stats.py
+    # Save Stats
     stats_out = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.read_stats.json")
     if not os.path.exists(os.path.dirname(stats_out)):
         os.makedirs(os.path.dirname(stats_out))
@@ -762,17 +722,14 @@ def main():
     }
     with open(stats_out, 'w') as f:
         json.dump(stats_data, f)
-    print(f"Saved intermediate stats to {stats_out}")
 
     # Final Merge
     if len(bams_to_merge) == 1:
-        print(f"Moving final BAM to {final_bam}")
         os.rename(bams_to_merge[0], final_bam)
     elif len(bams_to_merge) > 1:
-        print(f"Merging BAMs to {final_bam}")
-        cmd = [samtools_exec, 'cat', '-o', final_bam] + bams_to_merge
+        print(f"Merging BAMs with {num_threads} threads...")
+        cmd = [samtools_exec, 'cat', '-@', str(num_threads), '-o', final_bam] + bams_to_merge
         subprocess.check_call(cmd)
-        # Cleanup merged parts if they were temporary
         for b in bams_to_merge:
             if os.path.exists(b): os.remove(b)
     else:

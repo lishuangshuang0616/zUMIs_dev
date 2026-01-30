@@ -28,10 +28,14 @@ def cluster_umis(umis, threshold=1):
     Optimized UMI clustering using hash-based neighbor search.
     Complexity: O(N * L) instead of O(N^2).
     """
-    if not umis: return {}
+    if not umis:
+        return {}
     
-    # 1. Frequency counting
-    counts = Counter(umis)
+    counts = Counter()
+    if isinstance(umis, (dict, Counter)):
+        counts.update(umis)
+    else:
+        counts.update(umis)
     
     # 2. Sort unique UMIs: descending count, then lexicographical
     # This ensures we always map lower-count/variant UMIs to higher-count/canonical ones
@@ -118,28 +122,34 @@ def process_barcode_worker(args):
     all_genes = genes_exon | genes_intron
     
     for gene in all_genes:
-        umis_ex = umis_exon_map.get(gene, [])
-        umis_in = umis_intron_map.get(gene, [])
-        umis_total = umis_ex + umis_in
+        umis_ex_counts = umis_exon_map.get(gene)
+        umis_in_counts = umis_intron_map.get(gene)
+
+        if not umis_ex_counts and not umis_in_counts:
+            continue
         
-        if not umis_total: continue
+        umis_total_counts = Counter()
+        if umis_ex_counts:
+            umis_total_counts.update(umis_ex_counts)
+        if umis_in_counts:
+            umis_total_counts.update(umis_in_counts)
         
         # Cluster
-        mapping = cluster_umis(umis_total, threshold=ham_dist)
+        mapping = cluster_umis(umis_total_counts, threshold=ham_dist)
         
         if ham_dist > 0:
             res_correction[gene] = mapping
             
         # Count
-        unique_total = set([mapping[u] for u in umis_total])
+        unique_total = set(mapping[u] for u in umis_total_counts.keys())
         res_umi_counts_inex[gene] = len(unique_total)
         
-        if umis_ex:
-            unique_ex = set([mapping[u] for u in umis_ex])
+        if umis_ex_counts:
+            unique_ex = set(mapping[u] for u in umis_ex_counts.keys())
             res_umi_counts_exon[gene] = len(unique_ex)
             
-        if umis_in:
-            unique_in = set([mapping[u] for u in umis_in])
+        if umis_in_counts:
+            unique_in = set(mapping[u] for u in umis_in_counts.keys())
             res_umi_counts_intron[gene] = len(unique_in)
             
     return bc, res_umi_counts_exon, res_umi_counts_intron, res_umi_counts_inex, res_correction
@@ -159,10 +169,7 @@ def load_barcodes(out_dir, project):
     Priority 1: expect_id_barcode.tsv (Well IDs) - Ensures all wells are present & consistent.
     Priority 2: kept_barcodes.txt (Detected Seqs) - Fallback for droplet/unstructured data.
     """
-    # 1. Try Expect ID File (Config Dir)
-    # out_dir is usually ".../analysis"
-    # config is ".../config"
-    config_dir = os.path.join(os.path.dirname(out_dir.rstrip('/')), "config")
+    config_dir = os.path.join(out_dir, "config")
     expect_file = os.path.join(config_dir, "expect_id_barcode.tsv")
     
     barcodes = []
@@ -253,33 +260,39 @@ def write_sparse_matrix(counts_dict, gene_list, gene_names_map, barcode_list, ou
     gene_to_idx = {g: i for i, g in enumerate(gene_list)}
     bc_to_idx = {b: i for i, b in enumerate(barcode_list)}
     
-    triplets = []
-    
-    # Collect data
+    rows = []
+    cols = []
+    data = []
+
     for bc, gene_counts in counts_dict.items():
-        if bc not in bc_to_idx: continue
-        bc_idx = bc_to_idx[bc]
-        
+        bc_idx = bc_to_idx.get(bc)
+        if bc_idx is None:
+            continue
         for gene, count in gene_counts.items():
-            if count > 0 and gene in gene_to_idx:
-                gene_idx = gene_to_idx[gene]
-                # Store as (bc_idx, gene_idx, count) for sorting
-                triplets.append((bc_idx, gene_idx, count))
-                
-    # Sort: Primary = Barcode index (Col), Secondary = Gene index (Row)
-    # This produces the requested "Barcode then Feature" order in the file
-    triplets.sort(key=lambda x: (x[0], x[1]))
-    
-    # Re-extract for matrix creation
-    # Note: coo_matrix expects (data, (row_indices, col_indices))
-    rows = [t[1] for t in triplets]
-    cols = [t[0] for t in triplets]
-    data = [t[2] for t in triplets]
-                
-    # Shape is fixed to the full reference lists
-    mat = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(len(gene_list), len(barcode_list)))
-    
-    # Optimized: Write directly to gzip stream to avoid temp file I/O
+            if count <= 0:
+                continue
+            gene_idx = gene_to_idx.get(gene)
+            if gene_idx is None:
+                continue
+            cols.append(bc_idx)
+            rows.append(gene_idx)
+            data.append(int(count))
+
+    if data:
+        rows = np.asarray(rows, dtype=np.int32)
+        cols = np.asarray(cols, dtype=np.int32)
+        data = np.asarray(data, dtype=np.int32)
+        order = np.lexsort((rows, cols))
+        rows = rows[order]
+        cols = cols[order]
+        data = data[order]
+        nnz = int(data.size)
+    else:
+        rows = np.asarray([], dtype=np.int32)
+        cols = np.asarray([], dtype=np.int32)
+        data = np.asarray([], dtype=np.int32)
+        nnz = 0
+
     matrix_file_gz = os.path.join(full_out_dir, "matrix.mtx.gz")
     
     # Manually write MatrixMarket format to gzip stream
@@ -288,12 +301,13 @@ def write_sparse_matrix(counts_dict, gene_list, gene_names_map, barcode_list, ou
     with gzip.open(matrix_file_gz, 'wt') as f:
         f.write("%%MatrixMarket matrix coordinate integer general\n")
         f.write("%\n")
-        f.write(f"{mat.shape[0]} {mat.shape[1]} {mat.nnz}\n")
+        f.write(f"{len(gene_list)} {len(barcode_list)} {nnz}\n")
         
-        # Data: row col val (1-based)
-        # Zip iterators are faster than index access
-        for r, c, d in zip(mat.row, mat.col, mat.data):
-            f.write(f"{r+1} {c+1} {d}\n")
+        chunk_size = 100_000
+        for start in range(0, nnz, chunk_size):
+            end = min(start + chunk_size, nnz)
+            lines = [f"{int(rows[i]) + 1} {int(cols[i]) + 1} {int(data[i])}\n" for i in range(start, end)]
+            f.write("".join(lines))
 
     with gzip.open(os.path.join(full_out_dir, "barcodes.tsv.gz"), "wt") as f:
         for bc in barcode_list:
@@ -326,10 +340,10 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     
     print(f"Processing {bam_file}")
     
-    # Structure: data[category][barcode][gene] = list_of_umis
+    # Structure: data[category][barcode][gene] = Counter(umi)->count
     umi_data = {
-        'exon': defaultdict(lambda: defaultdict(list)),
-        'intron': defaultdict(lambda: defaultdict(list))
+        'exon': defaultdict(lambda: defaultdict(Counter)),
+        'intron': defaultdict(lambda: defaultdict(Counter))
     }
     
     # Structure: read_counts_raw[category][barcode][gene] = int
@@ -368,7 +382,8 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             
             # Store UMI
             if read.has_tag("UR"):
-                umi_data[ftype][bc][gene_id].append(read.get_tag("UR"))
+                umi = read.get_tag("UR")
+                umi_data[ftype][bc][gene_id][umi] += 1
 
     print("Pass 1 Complete. Calculating Statistics...")
 
@@ -402,7 +417,7 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     
     pool_args = []
     for bc in all_bcs_umis:
-        pool_args.append((bc, umi_data['exon'][bc], umi_data['intron'][bc], ham_dist))
+        pool_args.append((bc, umi_data['exon'].get(bc, {}), umi_data['intron'].get(bc, {}), ham_dist))
         
     if threads > 1:
         # Parallel Processing
@@ -470,33 +485,28 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             # template=infile ensures header is copied
             with pysam.AlignmentFile(sort_process.stdin, "wb", template=infile, threads=threads) as outfile:
                 for read in infile:
-                    # Process UMI tags if UR exists
-                    if read.has_tag("UR"):
-                        raw_umi = read.get_tag("UR")
-                        
-                        # Check if assigned to gene
-                        if read.has_tag("CB") and read.has_tag("GX"):
-                            bc = read.get_tag("CB")
-                            gene = read.get_tag("GX")
-                            
-                            final_umi = raw_umi
-                            # Apply correction
-                            if ham_dist > 0:
-                                # Safe dictionary lookup without explicit existence check
-                                # correction_map is defaultdict(lambda: defaultdict(dict))
-                                # Using .get() on standard dicts is safer, but for defaultdict we must be careful
-                                # Accessing correction_map[bc] creates it if missing, which is bad for memory if bc is junk.
-                                # Use get() on the defaultdict itself to avoid creation.
-                                bc_map = correction_map.get(bc)
-                                if bc_map:
-                                    gene_map = bc_map.get(gene)
-                                    if gene_map:
-                                        # Use get() for final lookup, default to raw_umi
-                                        final_umi = gene_map.get(raw_umi, raw_umi)
-                            
-                            read.set_tag("UB", final_umi)
-                        else:
-                            read.set_tag("UB", None)
+                    if not read.has_tag("UR"):
+                        outfile.write(read)
+                        continue
+
+                    raw_umi = read.get_tag("UR")
+                    if ham_dist <= 0:
+                        read.set_tag("UB", raw_umi)
+                        outfile.write(read)
+                        continue
+
+                    if read.has_tag("CB") and read.has_tag("GX"):
+                        bc = read.get_tag("CB")
+                        gene = read.get_tag("GX")
+                        final_umi = raw_umi
+                        bc_map = correction_map.get(bc)
+                        if bc_map:
+                            gene_map = bc_map.get(gene)
+                            if gene_map:
+                                final_umi = gene_map.get(raw_umi, raw_umi)
+                        read.set_tag("UB", final_umi)
+                    else:
+                        read.set_tag("UB", None)
                     
                     outfile.write(read)
                     
