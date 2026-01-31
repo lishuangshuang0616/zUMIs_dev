@@ -57,6 +57,8 @@ DEFAULT_CONFIG = {
         "twoPass": False
     },
     "make_stats": True,
+    "make_sorted_bam": False,
+    "make_ub_bam": False,
     "which_Stage": "Filtering",
     "zUMIs_directory": ".",         # Will be resolved relative to script
     "read_layout": "PE"             # Default PE, verified by script

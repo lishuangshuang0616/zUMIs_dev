@@ -12,6 +12,8 @@ import scipy.sparse
 import numpy as np
 import pandas as pd
 import multiprocessing
+import json
+import shutil
 
 try:
     import pysam
@@ -83,20 +85,6 @@ def cluster_umis(umis, threshold=1):
         # Check which neighbors are in our dataset
         for child in neighbors:
             if child in umi_set and child not in visited:
-                child_count = counts[child]
-                
-                # Logic: directional adjacency
-                # Usually we merge if parent count >= (2 * child count) - 1
-                # But here we use zUMIs-like simple logic: merge if parent count >= child count
-                # Since we sorted by count, parent is guaranteed to be >= child (mostly), 
-                # or equal but lexicographically smaller.
-                
-                # To follow strict "directional" method from UMI-tools:
-                # if parent_count >= (2 * child_count) - 1:
-                
-                # Using simple logic consistent with previous implementation:
-                # Merge if valid neighbor found. The sorting priority handles the "best parent" selection.
-                
                 parent_map[child] = parent
                 visited.add(child)
 
@@ -121,38 +109,169 @@ def process_barcode_worker(args):
     genes_intron = set(umis_intron_map.keys())
     all_genes = genes_exon | genes_intron
     
+    dist_counts = []
     for gene in all_genes:
         umis_ex_counts = umis_exon_map.get(gene)
         umis_in_counts = umis_intron_map.get(gene)
 
         if not umis_ex_counts and not umis_in_counts:
             continue
-        
+
         umis_total_counts = Counter()
         if umis_ex_counts:
             umis_total_counts.update(umis_ex_counts)
         if umis_in_counts:
             umis_total_counts.update(umis_in_counts)
-        
-        # Cluster
+
         mapping = cluster_umis(umis_total_counts, threshold=ham_dist)
-        
+
         if ham_dist > 0:
             res_correction[gene] = mapping
-            
-        # Count
+
         unique_total = set(mapping[u] for u in umis_total_counts.keys())
         res_umi_counts_inex[gene] = len(unique_total)
-        
+
+        canonical_counts = Counter()
+        for u, cnt in umis_total_counts.items():
+            canonical_counts[mapping[u]] += cnt
+        dist_counts.extend(list(canonical_counts.values()))
+
         if umis_ex_counts:
             unique_ex = set(mapping[u] for u in umis_ex_counts.keys())
             res_umi_counts_exon[gene] = len(unique_ex)
-            
+
         if umis_in_counts:
             unique_in = set(mapping[u] for u in umis_in_counts.keys())
             res_umi_counts_intron[gene] = len(unique_in)
-            
-    return bc, res_umi_counts_exon, res_umi_counts_intron, res_umi_counts_inex, res_correction
+
+    return bc, res_umi_counts_exon, res_umi_counts_intron, res_umi_counts_inex, res_correction, dist_counts
+
+def count_worker(args):
+    """
+    Worker for Pass 1: Count UMIs and Reads in a genomic region.
+    """
+    bam_file, chroms, barcode_set, gene_set, count_introns = args
+    
+    local_read_counts_raw = {
+        'exon': defaultdict(lambda: defaultdict(int)),
+        'intron': defaultdict(lambda: defaultdict(int))
+    }
+    local_umi_data = {
+        'exon': defaultdict(lambda: defaultdict(Counter)),
+        'intron': defaultdict(lambda: defaultdict(Counter))
+    }
+    
+    try:
+        with pysam.AlignmentFile(bam_file, "rb") as bam:
+            for chrom in chroms:
+                try:
+                    iter_reads = bam.fetch(chrom)
+                except ValueError:
+                    continue 
+                    
+                for read in iter_reads:
+                    if read.is_unmapped: continue
+                    try:
+                        bc = read.get_tag("CB")
+                        gene_id = read.get_tag("GX")
+                    except KeyError:
+                        continue 
+                    
+                    if bc not in barcode_set: continue
+                    if gene_set and gene_id not in gene_set: continue
+                    
+                    ftype = "exon"
+                    if read.has_tag("RE"):
+                        xf = read.get_tag("RE")
+                        if xf == "N": ftype = "intron"
+                        elif xf == "E": ftype = "exon"
+                        else: continue
+                    
+                    if not count_introns and ftype == 'intron': continue
+                    
+                    local_read_counts_raw[ftype][bc][gene_id] += 1
+                    
+                    umi = None
+                    if read.has_tag("UR"):
+                        umi = read.get_tag("UR")
+                    elif read.has_tag("UB"):
+                        umi = read.get_tag("UB")
+                    if umi:
+                        local_umi_data[ftype][bc][gene_id][umi] += 1
+                        
+    except Exception as e:
+        print(f"Error in count_worker for {chroms}: {e}")
+        return None
+
+    # Convert to standard dicts to allow pickling (remove lambdas)
+    ret_read_counts = {
+        'exon': {k: dict(v) for k, v in local_read_counts_raw['exon'].items()},
+        'intron': {k: dict(v) for k, v in local_read_counts_raw['intron'].items()}
+    }
+    ret_umi_data = {
+        'exon': {k: dict(v) for k, v in local_umi_data['exon'].items()},
+        'intron': {k: dict(v) for k, v in local_umi_data['intron'].items()}
+    }
+
+    return ret_read_counts, ret_umi_data
+
+def correction_worker(args):
+    """
+    Worker for Pass 2: Correct UMIs.
+    Writes to a temporary sorted BAM file (chunks).
+    Input BAM is already sorted, so we just read and write in order.
+    """
+    bam_file, chroms, correction_map, ham_dist, out_tmp_bam = args
+    
+    try:
+        with pysam.AlignmentFile(bam_file, "rb") as infile:
+            with pysam.AlignmentFile(out_tmp_bam, "wb", template=infile) as outfile:
+                for chrom in chroms:
+                    try:
+                        iter_reads = infile.fetch(chrom)
+                    except ValueError:
+                        continue
+                        
+                    for read in iter_reads:
+                        raw_umi = None
+                        if read.has_tag("UR"):
+                            raw_umi = read.get_tag("UR")
+                        elif read.has_tag("UB"):
+                            raw_umi = read.get_tag("UB")
+                        if not raw_umi:
+                            outfile.write(read)
+                            continue
+                        if ham_dist <= 0:
+                            read.set_tag("UB", raw_umi)
+                            outfile.write(read)
+                            continue
+
+                        if read.has_tag("CB") and read.has_tag("GX"):
+                            bc = read.get_tag("CB")
+                            gene = read.get_tag("GX")
+                            final_umi = raw_umi
+                            
+                            if bc in correction_map:
+                                bc_map = correction_map[bc]
+                                if gene in bc_map:
+                                    final_umi = bc_map[gene].get(raw_umi, raw_umi)
+                            
+                            # Ensure final_umi is a string
+                            if final_umi is None: 
+                                final_umi = raw_umi
+                                    
+                            read.set_tag("UB", str(final_umi))
+                        else:
+                            # Revert: If no cell/gene assignment, remove UB tag (as requested)
+                            read.set_tag("UB", None)
+                        
+                        outfile.write(read)
+        
+        return out_tmp_bam
+        
+    except Exception as e:
+        print(f"Error in correction_worker for {chroms}: {e}")
+        return None
 
 def natural_sort_key(s):
     """
@@ -323,6 +442,7 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     out_dir = config['out_dir']
     ham_dist = int(config['counting_opts'].get('Ham_Dist', 0))
     count_introns = config.get('counting_opts', {}).get('introns', True)
+    samtools_exec = sys.argv[2] # Passed from main
     
     # Load Reference Lists
     gtf_file = os.path.join(out_dir, f"{project}.final_annot.gtf")
@@ -338,194 +458,234 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
     
     print(f"Reference: {len(barcode_list)} Barcodes (Cols), {len(gene_list)} Genes (Rows)")
     
-    print(f"Processing {bam_file}")
-    
-    # Structure: data[category][barcode][gene] = Counter(umi)->count
-    umi_data = {
-        'exon': defaultdict(lambda: defaultdict(Counter)),
-        'intron': defaultdict(lambda: defaultdict(Counter))
-    }
-    
-    # Structure: read_counts_raw[category][barcode][gene] = int
-    read_counts_raw = {
-        'exon': defaultdict(lambda: defaultdict(int)),
-        'intron': defaultdict(lambda: defaultdict(int))
-    }
-    
-    correction_map = defaultdict(lambda: defaultdict(dict))
-    
-    print("Pass 1: Reading BAM to aggregate UMIs and Reads...")
-    with pysam.AlignmentFile(bam_file, "rb", threads=threads) as bam:
-        for read in bam:
-            if read.is_unmapped: continue
-            try:
-                bc = read.get_tag("CB")
-                gene_id = read.get_tag("GX")
-            except KeyError:
-                continue 
-            
-            # Filter strictly by Reference Lists
-            if bc not in barcode_set: continue
-            if gene_id not in gene_set: continue
-            
-            ftype = "exon"
-            if read.has_tag("RE"):
-                xf = read.get_tag("RE")
-                if xf == "N": ftype = "intron"
-                elif xf == "E": ftype = "exon"
-                else: continue
-            
-            if not count_introns and ftype == 'intron': continue
-            
-            # Increment raw read count
-            read_counts_raw[ftype][bc][gene_id] += 1
-            
-            # Store UMI
-            if read.has_tag("UR"):
-                umi = read.get_tag("UR")
-                umi_data[ftype][bc][gene_id][umi] += 1
+    # Ensure BAM Index for Parallel Access
+    temp_sorted_bam = None
+    try:
+        if not os.path.exists(bam_file + ".bai"):
+            print(f"Indexing BAM {bam_file} for parallel processing...")
+            pysam.index(bam_file)
+    except Exception as e:
+        print(f"BAM Indexing failed ({e}). Assuming BAM is not coordinate sorted.")
+        print(f"Sorting input BAM to temporary file using {threads} threads...")
+        temp_sorted_bam = bam_file + ".temp_sorted.bam"
+        sort_cmd = [samtools_exec, "sort", "-@", str(threads), "-o", temp_sorted_bam, bam_file]
+        subprocess.check_call(sort_cmd)
+        print("Indexing temporary sorted BAM...")
+        pysam.index(temp_sorted_bam)
+        bam_file = temp_sorted_bam
 
-    print("Pass 1 Complete. Calculating Statistics...")
-
-    # Final count containers
-    final_umi_counts = {
-        'exon': defaultdict(lambda: defaultdict(int)),
-        'intron': defaultdict(lambda: defaultdict(int)),
-        'inex': defaultdict(lambda: defaultdict(int))
-    }
-    
-    final_read_counts = {
-        'exon': read_counts_raw['exon'],
-        'intron': read_counts_raw['intron'],
-        'inex': defaultdict(lambda: defaultdict(int))
-    }
-
-    # Calculate Inex Read Counts
-    for bc in read_counts_raw['exon']:
-        for gene in read_counts_raw['exon'][bc]:
-            final_read_counts['inex'][bc][gene] += read_counts_raw['exon'][bc][gene]
+    try:
+        # Get Chromosomes
+        with pysam.AlignmentFile(bam_file, "rb") as b:
+            references = b.references
             
-    for bc in read_counts_raw['intron']:
-        for gene in read_counts_raw['intron'][bc]:
-            final_read_counts['inex'][bc][gene] += read_counts_raw['intron'][bc][gene]
-
-    # Calculate UMI Counts (with Clustering)
-    all_bcs_umis = list(set(umi_data['exon'].keys()) | set(umi_data['intron'].keys()))
-    total_bcs = len(all_bcs_umis)
-    
-    print(f"Clustering UMIs for {total_bcs} barcodes using {threads} threads...")
-    
-    pool_args = []
-    for bc in all_bcs_umis:
-        pool_args.append((bc, umi_data['exon'].get(bc, {}), umi_data['intron'].get(bc, {}), ham_dist))
+        # Split chromosomes into chunks for workers
+        chunk_size = max(1, len(references) // threads)
+        ref_chunks = [references[i:i + chunk_size] for i in range(0, len(references), chunk_size)]
         
-    if threads > 1:
-        # Parallel Processing
+        print(f"Pass 1: Parallel Counting ({threads} threads, {len(ref_chunks)} chunks)...")
+        
+        # --- PASS 1: Parallel Counting ---
+        read_counts_raw = {
+            'exon': defaultdict(lambda: defaultdict(int)),
+            'intron': defaultdict(lambda: defaultdict(int))
+        }
+        umi_data = {
+            'exon': defaultdict(lambda: defaultdict(Counter)),
+            'intron': defaultdict(lambda: defaultdict(Counter))
+        }
+        
+        pass1_args = [(bam_file, chunk, barcode_set, gene_set, count_introns) for chunk in ref_chunks]
+        
         with multiprocessing.Pool(threads) as pool:
-            # imap_unordered yields results as they complete
-            for i, res in enumerate(pool.imap_unordered(process_barcode_worker, pool_args, chunksize=20)):
-                if i % 100 == 0: 
-                    print(f"Clustering Barcode {i}/{total_bcs}...", end='\r')
+            for res in pool.imap_unordered(count_worker, pass1_args):
+                if not res: continue
                 
-                bc, c_ex, c_in, c_inex, corr = res
+                partial_read, partial_umi = res
+                
+                # Merge logic (In-memory reduce)
+                for ftype in ['exon', 'intron']:
+                    # Merge Read Counts
+                    for bc, genes in partial_read[ftype].items():
+                        for gene, count in genes.items():
+                            read_counts_raw[ftype][bc][gene] += count
+                    
+                    # Merge UMI Data
+                    for bc, genes in partial_umi[ftype].items():
+                        for gene, umis in genes.items():
+                            umi_data[ftype][bc][gene].update(umis)
+
+        print("Pass 1 Complete. Calculating Statistics...")
+
+        # Final count containers
+        final_umi_counts = {
+            'exon': defaultdict(lambda: defaultdict(int)),
+            'intron': defaultdict(lambda: defaultdict(int)),
+            'inex': defaultdict(lambda: defaultdict(int))
+        }
+        
+        final_read_counts = {
+            'exon': read_counts_raw['exon'],
+            'intron': read_counts_raw['intron'],
+            'inex': defaultdict(lambda: defaultdict(int))
+        }
+
+        # Container for Saturation Distribution (Frequency of Read Counts)
+        global_umi_freq = Counter()
+
+        # Calculate Inex Read Counts
+        for bc in read_counts_raw['exon']:
+            for gene in read_counts_raw['exon'][bc]:
+                final_read_counts['inex'][bc][gene] += read_counts_raw['exon'][bc][gene]
+                
+        for bc in read_counts_raw['intron']:
+            for gene in read_counts_raw['intron'][bc]:
+                final_read_counts['inex'][bc][gene] += read_counts_raw['intron'][bc][gene]
+
+        # Calculate UMI Counts (with Clustering)
+        all_bcs_umis = list(set(umi_data['exon'].keys()) | set(umi_data['intron'].keys()))
+        total_bcs = len(all_bcs_umis)
+        
+        print(f"Clustering UMIs for {total_bcs} barcodes using {threads} threads (Ham_Dist={ham_dist})...")
+        
+        pool_args = []
+        for bc in all_bcs_umis:
+            pool_args.append((bc, umi_data['exon'].get(bc, {}), umi_data['intron'].get(bc, {}), ham_dist))
+            
+        correction_map = defaultdict(lambda: defaultdict(dict))
+        
+        with multiprocessing.Pool(threads) as pool:
+             for i, res in enumerate(pool.imap_unordered(process_barcode_worker, pool_args, chunksize=20)):
+                if i % 100 == 0: print(f"Clustering {i}/{total_bcs}...", end='\r')
+                
+                bc, c_ex, c_in, c_inex, corr, dist = res
                 
                 if c_ex: final_umi_counts['exon'][bc].update(c_ex)
                 if c_in: final_umi_counts['intron'][bc].update(c_in)
                 if c_inex: final_umi_counts['inex'][bc].update(c_inex)
-                if corr:
-                    correction_map[bc].update(corr)
-    else:
-        # Serial Processing
-        for i, args in enumerate(pool_args):
-            if i % 100 == 0: 
-                print(f"Clustering Barcode {i}/{total_bcs}...", end='\r')
-            
-            bc, c_ex, c_in, c_inex, corr = process_barcode_worker(args)
-            
-            if c_ex: final_umi_counts['exon'][bc].update(c_ex)
-            if c_in: final_umi_counts['intron'][bc].update(c_in)
-            if c_inex: final_umi_counts['inex'][bc].update(c_inex)
-            if corr:
-                correction_map[bc].update(corr)
+                if corr: correction_map[bc].update(corr)
+                if dist: global_umi_freq.update(dist)
 
-    print("\nWriting Matrices...")
-    
-    # Write UMI Counts
-    write_sparse_matrix(final_umi_counts['exon'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.exon.umi")
-    if count_introns:
-        write_sparse_matrix(final_umi_counts['intron'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.intron.umi")
-        write_sparse_matrix(final_umi_counts['inex'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.inex.umi")
+        print("\nWriting Matrices...")
         
-    # Write Read Counts
-    write_sparse_matrix(final_read_counts['exon'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.exon.read")
-    if count_introns:
-        write_sparse_matrix(final_read_counts['intron'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.intron.read")
-        write_sparse_matrix(final_read_counts['inex'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.inex.read")
-    
-    # --- PASS 2: BAM Correction & Streaming Sort ---
-    print("Pass 2: Correcting BAM and streaming to samtools sort...")
-    
-    # Construct samtools sort command
-    # Sorts from stdin (-) to out_bam
-    sort_cmd = [
-        sys.argv[2], # samtools_exec passed from main
-        "sort",
-        "-@", str(threads),
-        "-T", out_bam + ".sort_tmp",
-        "-o", out_bam,
-        "-"
-    ]
-    
-    sort_process = subprocess.Popen(sort_cmd, stdin=subprocess.PIPE, bufsize=10*1024*1024)
-    
-    try:
-        with pysam.AlignmentFile(bam_file, "rb", threads=threads) as infile:
-            # Open a pysam writer pointing to the sort process's stdin
-            # We use "wb" mode and pass the process's stdin as the file
-            # template=infile ensures header is copied
-            with pysam.AlignmentFile(sort_process.stdin, "wb", template=infile, threads=threads) as outfile:
-                for read in infile:
-                    if not read.has_tag("UR"):
-                        outfile.write(read)
-                        continue
+        # Calculate and print correction stats
+        total_corrections = 0
+        for bc in correction_map:
+            for gene in correction_map[bc]:
+                for child, parent in correction_map[bc][gene].items():
+                    if child != parent:
+                        total_corrections += 1
+        print(f"Total UMI corrections found: {total_corrections}")
+        if ham_dist > 0 and total_corrections == 0:
+            print("WARNING: Ham_Dist > 0 but no corrections found. Check input data or barcode matching.")
 
-                    raw_umi = read.get_tag("UR")
-                    if ham_dist <= 0:
-                        read.set_tag("UB", raw_umi)
-                        outfile.write(read)
-                        continue
+        
+        # Write Saturation Data (Histogram)
+        sat_file = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.saturation_dist.json")
+        if not os.path.exists(os.path.dirname(sat_file)):
+            os.makedirs(os.path.dirname(sat_file))
+        print(f"Writing saturation distribution histogram to {sat_file}...")
+        with open(sat_file, 'w') as f:
+            json.dump(dict(global_umi_freq), f)
 
-                    if read.has_tag("CB") and read.has_tag("GX"):
-                        bc = read.get_tag("CB")
-                        gene = read.get_tag("GX")
-                        final_umi = raw_umi
-                        bc_map = correction_map.get(bc)
-                        if bc_map:
-                            gene_map = bc_map.get(gene)
-                            if gene_map:
-                                final_umi = gene_map.get(raw_umi, raw_umi)
-                        read.set_tag("UB", final_umi)
-                    else:
-                        read.set_tag("UB", None)
-                    
-                    outfile.write(read)
-                    
-    except Exception as e:
-        print(f"Error during BAM streaming: {e}")
-        sort_process.kill()
-        raise
+        # Write Matrices
+        write_sparse_matrix(final_umi_counts['exon'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.exon.umi")
+        if count_introns:
+            write_sparse_matrix(final_umi_counts['intron'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.intron.umi")
+            write_sparse_matrix(final_umi_counts['inex'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.inex.umi")
+            
+        write_sparse_matrix(final_read_counts['exon'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.exon.read")
+        if count_introns:
+            write_sparse_matrix(final_read_counts['intron'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.intron.read")
+            write_sparse_matrix(final_read_counts['inex'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.inex.read")
+
+        make_sorted_bam = bool(config.get('make_sorted_bam', False))
+        make_ub_bam = bool(config.get('make_ub_bam', False))
+        if not make_sorted_bam and not make_ub_bam:
+            return
+
+        if make_ub_bam and not make_sorted_bam:
+            if not out_bam:
+                out_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.UBcorrected.bam")
+            with pysam.AlignmentFile(bam_file, "rb") as infile:
+                with pysam.AlignmentFile(out_bam, "wb", template=infile) as outfile:
+                    for read in infile.fetch(until_eof=True):
+                        raw_umi = None
+                        if read.has_tag("UR"):
+                            raw_umi = read.get_tag("UR")
+                        elif read.has_tag("UB"):
+                            raw_umi = read.get_tag("UB")
+                        if not raw_umi:
+                            outfile.write(read)
+                            continue
+
+                        if ham_dist <= 0:
+                            read.set_tag("UB", raw_umi)
+                            outfile.write(read)
+                            continue
+
+                        if read.has_tag("CB") and read.has_tag("GX"):
+                            bc = read.get_tag("CB")
+                            gene = read.get_tag("GX")
+                            final_umi = raw_umi
+                            bc_map = correction_map.get(bc)
+                            if bc_map:
+                                gene_map = bc_map.get(gene)
+                                if gene_map:
+                                    final_umi = gene_map.get(raw_umi, raw_umi)
+                            if final_umi is None:
+                                final_umi = raw_umi
+                            read.set_tag("UB", str(final_umi))
+                        else:
+                            read.set_tag("UB", None)
+
+                        outfile.write(read)
+
+            return
+        
+        # --- PASS 2: Parallel Correction & Sorting ---
+        print(f"Pass 2: Parallel Correction & Sorting ({threads} threads)...")
+        
+        # Fix for PicklingError: Deeply convert nested defaultdict to standard dict
+        print("Preparing correction map for parallel processing...")
+        final_correction_map = {}
+        for bc, gene_dict in correction_map.items():
+            final_correction_map[bc] = {g: dict(u) for g, u in gene_dict.items()}
+
+        temp_bams = []
+        tmp_chunk_dir = out_bam + ".chunks"
+        if not os.path.exists(tmp_chunk_dir): os.makedirs(tmp_chunk_dir)
+        
+        pass2_args = []
+        for i, chunk in enumerate(ref_chunks):
+            out_tmp = os.path.join(tmp_chunk_dir, f"chunk_{i}.bam")
+            pass2_args.append((bam_file, chunk, final_correction_map, ham_dist, out_tmp))
+        
+        with multiprocessing.Pool(threads) as pool:
+            for res_bam in pool.imap_unordered(correction_worker, pass2_args):
+                if res_bam:
+                    temp_bams.append(res_bam)
+                    print(f"Chunk finished: {os.path.basename(res_bam)}")
+        
+        print("Merging sorted chunks...")
+        if not temp_bams:
+            print("Error: No BAM chunks generated.")
+            sys.exit(1)
+            
+        merge_cmd = [samtools_exec, "merge", "-f", "-@", str(threads), out_bam] + temp_bams
+        subprocess.check_call(merge_cmd)
+        
+        shutil.rmtree(tmp_chunk_dir)
+        
+        print("Indexing Final BAM...")
+        pysam.index(out_bam)
+        
     finally:
-        # Close stdin to signal EOF to samtools sort
-        if sort_process.stdin:
-            sort_process.stdin.close()
-        
-        # Wait for sort to finish
-        ret = sort_process.wait()
-        if ret != 0:
-            raise RuntimeError(f"samtools sort failed with return code {ret}")
-    
-    print("Indexing...")
-    pysam.index(out_bam)
+        if temp_sorted_bam and os.path.exists(temp_sorted_bam):
+            print(f"Cleaning up temporary sorted BAM: {temp_sorted_bam}")
+            os.remove(temp_sorted_bam)
+            if os.path.exists(temp_sorted_bam + ".bai"):
+                os.remove(temp_sorted_bam + ".bai")
 
 def main():
     if len(sys.argv) < 3:
@@ -540,8 +700,14 @@ def main():
     if not os.path.exists(input_bam):
         print(f"Error: Input BAM {input_bam} not found.")
         sys.exit(1)
-    final_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.UBcorrected.sorted.bam")
-    process_bam_and_matrix(input_bam, final_bam, config, threads=num_threads)
+    make_sorted_bam = bool(config.get('make_sorted_bam', False))
+    make_ub_bam = bool(config.get('make_ub_bam', False))
+    out_bam = None
+    if make_sorted_bam:
+        out_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.UBcorrected.sorted.bam")
+    elif make_ub_bam:
+        out_bam = os.path.join(out_dir, f"{project}.filtered.Aligned.GeneTagged.UBcorrected.bam")
+    process_bam_and_matrix(input_bam, out_bam, config, threads=num_threads)
     print("DGE Analysis pipeline finished.")
 
 if __name__ == "__main__":

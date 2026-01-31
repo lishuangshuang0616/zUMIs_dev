@@ -648,7 +648,9 @@ def main():
         
     # Check existence
     if not os.path.exists(umi_bam) and not os.path.exists(internal_bam):
-         print("Error: Input BAMs not found.")
+         print(f"Error: Input BAMs not found.")
+         print(f"Checked UMI BAM: {umi_bam}")
+         print(f"Checked Internal BAM: {internal_bam}")
          sys.exit(1)
 
     header_bam = umi_bam if os.path.exists(umi_bam) else internal_bam
