@@ -145,7 +145,7 @@ def process_barcode_worker(args):
             res_umi_counts_intron[gene] = len(unique_in)
 
     return bc, res_umi_counts_exon, res_umi_counts_intron, res_umi_counts_inex, res_correction, dist_counts
-
+                    
 def count_worker(args):
     """
     Worker for Pass 1: Count UMIs and Reads in a genomic region.
@@ -160,6 +160,8 @@ def count_worker(args):
         'exon': defaultdict(lambda: defaultdict(Counter)),
         'intron': defaultdict(lambda: defaultdict(Counter))
     }
+    # Global UMI counts for saturation (all reads with CB and UR)
+    local_global_umi_counts = defaultdict(Counter)
     
     try:
         with pysam.AlignmentFile(bam_file, "rb") as bam:
@@ -171,13 +173,22 @@ def count_worker(args):
                     
                 for read in iter_reads:
                     if read.is_unmapped: continue
+                    if not read.has_tag("CB"): continue
+                    
+                    bc = read.get_tag("CB")
+                    if bc not in barcode_set: continue
+                    
+                    # Track for global saturation if UMI exists
+                    if read.has_tag("UR"):
+                        umi = read.get_tag("UR")
+                        local_global_umi_counts[bc][umi] += 1
+                    
+                    # For gene-specific counts
                     try:
-                        bc = read.get_tag("CB")
                         gene_id = read.get_tag("GX")
                     except KeyError:
                         continue 
                     
-                    if bc not in barcode_set: continue
                     if gene_set and gene_id not in gene_set: continue
                     
                     ftype = "exon"
@@ -191,19 +202,15 @@ def count_worker(args):
                     
                     local_read_counts_raw[ftype][bc][gene_id] += 1
                     
-                    umi = None
                     if read.has_tag("UR"):
                         umi = read.get_tag("UR")
-                    elif read.has_tag("UB"):
-                        umi = read.get_tag("UB")
-                    if umi:
                         local_umi_data[ftype][bc][gene_id][umi] += 1
                         
     except Exception as e:
         print(f"Error in count_worker for {chroms}: {e}")
         return None
 
-    # Convert to standard dicts to allow pickling (remove lambdas)
+    # Convert to standard dicts to allow pickling
     ret_read_counts = {
         'exon': {k: dict(v) for k, v in local_read_counts_raw['exon'].items()},
         'intron': {k: dict(v) for k, v in local_read_counts_raw['intron'].items()}
@@ -212,8 +219,9 @@ def count_worker(args):
         'exon': {k: dict(v) for k, v in local_umi_data['exon'].items()},
         'intron': {k: dict(v) for k, v in local_umi_data['intron'].items()}
     }
+    ret_global_umi = {k: dict(v) for k, v in local_global_umi_counts.items()}
 
-    return ret_read_counts, ret_umi_data
+    return ret_read_counts, ret_umi_data, ret_global_umi
 
 def correction_worker(args):
     """
@@ -437,6 +445,26 @@ def write_sparse_matrix(counts_dict, gene_list, gene_names_map, barcode_list, ou
             g_name = gene_names_map.get(g_id, g_id)
             f.write(f"{g_id}\t{g_name}\tGene Expression\n")
 
+def cluster_with_global(bc_args):
+    """
+    Worker function for parallel UMI clustering (includes global saturation stats).
+    Moved to top-level to allow pickling.
+    """
+    bc, ex_map, in_map, global_counts, h_dist = bc_args
+    # Cluster for genes
+    res_bc, res_ex, res_in, res_inex, res_corr, gene_dist_counts = process_barcode_worker((bc, ex_map, in_map, h_dist))
+    
+    # Cluster for global saturation
+    global_dist_counts = []
+    if global_counts:
+        mapping = cluster_umis(global_counts, threshold=h_dist)
+        canonical_counts = Counter()
+        for u, cnt in global_counts.items():
+            canonical_counts[mapping[u]] += cnt
+        global_dist_counts = list(canonical_counts.values())
+    
+    return res_bc, res_ex, res_in, res_inex, res_corr, global_dist_counts, gene_dist_counts
+
 def process_bam_and_matrix(bam_file, out_bam, config, threads):
     project = config['project']
     out_dir = config['out_dir']
@@ -494,6 +522,7 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             'exon': defaultdict(lambda: defaultdict(Counter)),
             'intron': defaultdict(lambda: defaultdict(Counter))
         }
+        global_umi_raw = defaultdict(Counter)
         
         pass1_args = [(bam_file, chunk, barcode_set, gene_set, count_introns) for chunk in ref_chunks]
         
@@ -501,21 +530,27 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             for res in pool.imap_unordered(count_worker, pass1_args):
                 if not res: continue
                 
-                partial_read, partial_umi = res
+                partial_read, partial_umi, partial_global = res
                 
+                # Merge Global UMI (for saturation)
+                for bc, umis in partial_global.items():
+                    global_umi_raw[bc].update(umis)
+
                 # Merge logic (In-memory reduce)
                 for ftype in ['exon', 'intron']:
-                    # Merge Read Counts
                     for bc, genes in partial_read[ftype].items():
                         for gene, count in genes.items():
                             read_counts_raw[ftype][bc][gene] += count
                     
-                    # Merge UMI Data
                     for bc, genes in partial_umi[ftype].items():
                         for gene, umis in genes.items():
                             umi_data[ftype][bc][gene].update(umis)
 
         print("Pass 1 Complete. Calculating Statistics...")
+
+        # Container for Saturation Distribution (Frequency of Read Counts)
+        global_umi_freq = Counter()
+        gene_umi_freq = Counter()
 
         # Final count containers
         final_umi_counts = {
@@ -530,9 +565,6 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
             'inex': defaultdict(lambda: defaultdict(int))
         }
 
-        # Container for Saturation Distribution (Frequency of Read Counts)
-        global_umi_freq = Counter()
-
         # Calculate Inex Read Counts
         for bc in read_counts_raw['exon']:
             for gene in read_counts_raw['exon'][bc]:
@@ -543,28 +575,32 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
                 final_read_counts['inex'][bc][gene] += read_counts_raw['intron'][bc][gene]
 
         # Calculate UMI Counts (with Clustering)
-        all_bcs_umis = list(set(umi_data['exon'].keys()) | set(umi_data['intron'].keys()))
+        all_bcs_umis = list(set(umi_data['exon'].keys()) | set(umi_data['intron'].keys()) | set(global_umi_raw.keys()))
         total_bcs = len(all_bcs_umis)
         
         print(f"Clustering UMIs for {total_bcs} barcodes using {threads} threads (Ham_Dist={ham_dist})...")
         
+        # Modified worker to also cluster global UMIs
+        # cluster_with_global is now defined at module level
+
         pool_args = []
         for bc in all_bcs_umis:
-            pool_args.append((bc, umi_data['exon'].get(bc, {}), umi_data['intron'].get(bc, {}), ham_dist))
+            pool_args.append((bc, umi_data['exon'].get(bc, {}), umi_data['intron'].get(bc, {}), global_umi_raw.get(bc, {}), ham_dist))
             
         correction_map = defaultdict(lambda: defaultdict(dict))
         
         with multiprocessing.Pool(threads) as pool:
-             for i, res in enumerate(pool.imap_unordered(process_barcode_worker, pool_args, chunksize=20)):
+             for i, res in enumerate(pool.imap_unordered(cluster_with_global, pool_args, chunksize=20)):
                 if i % 100 == 0: print(f"Clustering {i}/{total_bcs}...", end='\r')
                 
-                bc, c_ex, c_in, c_inex, corr, dist = res
+                bc, c_ex, c_in, c_inex, corr, g_dist, gene_dist = res
                 
                 if c_ex: final_umi_counts['exon'][bc].update(c_ex)
                 if c_in: final_umi_counts['intron'][bc].update(c_in)
                 if c_inex: final_umi_counts['inex'][bc].update(c_inex)
                 if corr: correction_map[bc].update(corr)
-                if dist: global_umi_freq.update(dist)
+                if g_dist: global_umi_freq.update(g_dist)
+                if gene_dist: gene_umi_freq.update(gene_dist)
 
         print("\nWriting Matrices...")
         
@@ -582,11 +618,16 @@ def process_bam_and_matrix(bam_file, out_bam, config, threads):
         
         # Write Saturation Data (Histogram)
         sat_file = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.saturation_dist.json")
+        gene_sat_file = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.gene_saturation_dist.json")
+        
         if not os.path.exists(os.path.dirname(sat_file)):
             os.makedirs(os.path.dirname(sat_file))
-        print(f"Writing saturation distribution histogram to {sat_file}...")
+            
+        print(f"Writing saturation distribution histograms to {os.path.dirname(sat_file)}...")
         with open(sat_file, 'w') as f:
             json.dump(dict(global_umi_freq), f)
+        with open(gene_sat_file, 'w') as f:
+            json.dump(dict(gene_umi_freq), f)
 
         # Write Matrices
         write_sparse_matrix(final_umi_counts['exon'], gene_list, gene_names_ref, barcode_list, out_dir, f"{project}.exon.umi")

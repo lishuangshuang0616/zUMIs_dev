@@ -2,22 +2,10 @@
 import sys
 import os
 import yaml
-import subprocess
-import csv
 import collections
-import statistics
-import math
 import gzip
 import json
-
 import numpy as np
-import bisect
-
-try:
-    import pysam
-except ImportError:
-    # Not required if loading JSON stats
-    pass
 
 try:
     import matplotlib
@@ -31,7 +19,7 @@ def load_config(yaml_file):
     with open(yaml_file, 'r') as f:
         return yaml.safe_load(f)
 
-def load_barcode_mapping(out_dir, project):
+def load_barcode_mapping(out_dir, _project):
     mapping = {}
     expect_candidates = [
         os.path.join(out_dir, "config", "expect_id_barcode.tsv"),
@@ -188,78 +176,82 @@ def plot_gene_umi_counts_by_type(stats_exon, stats_intron, stats_inex, wells, ou
 def calculate_saturation(out_dir, project):
     """
     Calculates saturation metrics:
-    1. Sequencing Saturation (1 - UniqueUMIs/TotalReads) vs Fraction
-    2. Median Genes per Cell vs Fraction (based on Read Matrix)
+    1. Seq_Saturation_Library (Global UMI distribution)
+    2. Seq_Saturation_Gene (Gene-mapped UMI distribution)
+    3. Median Genes per Cell (UMI based)
+    4. Median Genes per Cell (Read based)
     """
-    sat_json = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.saturation_dist.json")
+    sat_json_global = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.saturation_dist.json")
+    sat_json_gene = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.gene_saturation_dist.json")
     
-    # Try to find Read Matrix (Exon or Inex)
-    # Prefer Inex if available (matches standard gene counts usually)
-    # Check for .inex.read first, then .exon.read
+    # Locate UMI and Read Matrices (Strictly enforce same type for comparison)
+    umi_matrix_dir = None
     read_matrix_dir = None
+    
+    # Prefer Intron+Exon (inex) if available, else Exon
     for seq_type in ["inex", "exon"]:
-        d = os.path.join(out_dir, "zUMIs_output", "expression", f"{project}.{seq_type}.read")
-        if os.path.exists(os.path.join(d, "matrix.mtx.gz")):
-            read_matrix_dir = d
+        d_umi = os.path.join(out_dir, "zUMIs_output", "expression", f"{project}.{seq_type}.umi")
+        d_read = os.path.join(out_dir, "zUMIs_output", "expression", f"{project}.{seq_type}.read")
+        
+        # Check for UMI matrix existence
+        if os.path.exists(os.path.join(d_umi, "matrix.mtx.gz")):
+            umi_matrix_dir = d_umi
+            # Only use Read matrix if it matches the SAME type
+            if os.path.exists(os.path.join(d_read, "matrix.mtx.gz")):
+                read_matrix_dir = d_read
+            else:
+                read_matrix_dir = None # Reset to ensure we don't mix types
+            
+            print(f"Using sequence type '{seq_type}' for saturation/stats (UMI: Yes, Read: {'Yes' if read_matrix_dir else 'No'})")
             break
             
-    if not os.path.exists(sat_json):
+    if not os.path.exists(sat_json_global):
         print("Saturation distribution file not found. Skipping saturation analysis.")
         return None
 
-    print(f"Loading saturation data from {sat_json}...")
-    with open(sat_json, 'r') as f:
-        umi_counts_dist = json.load(f)
-    
-    # Handle Histogram (Counter dict) format
-    if isinstance(umi_counts_dist, dict):
-        umi_counts = np.array([int(k) for k in umi_counts_dist.keys()], dtype=np.int64)
-        umi_freqs = np.array(list(umi_counts_dist.values()), dtype=np.int64)
-    else:
-        # Fallback for list format (legacy)
-        umi_counts = np.array(umi_counts_dist, dtype=np.int64)
-        umi_freqs = np.ones_like(umi_counts)
+    # Include more granular lower fractions as requested
+    fractions = np.array([0.01, 0.02, 0.05, 0.08, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
 
-    total_umi_reads = np.sum(umi_counts * umi_freqs)
-    
-    # Sequencing Saturation Calculation
-    fractions = np.linspace(0.1, 1.0, 10)
-    seq_saturation = []
-    
-    # Analytical Downsampling for UMI Saturation
-    # E[Unique] = Sum(Freq_k * (1 - (1-p)^k))
-    print("Calculating UMI Saturation...")
-    for f in fractions:
-        # Expected Total Reads at fraction f
-        exp_reads = f * total_umi_reads
+    def calc_sat_curve(json_file, fractions):
+        if not os.path.exists(json_file): return np.zeros(len(fractions))
         
-        # Expected Unique UMIs at fraction f
-        probs = 1.0 - np.power(1.0 - f, umi_counts)
-        exp_unique = np.sum(probs * umi_freqs)
+        with open(json_file, 'r') as f:
+            umi_counts_dist = json.load(f)
         
-        sat = 1.0 - (exp_unique / exp_reads) if exp_reads > 0 else 0.0
-        seq_saturation.append(sat)
+        if isinstance(umi_counts_dist, dict):
+            umi_counts = np.array([int(k) for k in umi_counts_dist.keys()], dtype=np.int64)
+            umi_freqs = np.array(list(umi_counts_dist.values()), dtype=np.int64)
+        else:
+            umi_counts = np.array(umi_counts_dist, dtype=np.int64)
+            umi_freqs = np.ones_like(umi_counts)
 
-    # Gene Saturation Calculation (Mean Genes per Cell)
-    gene_saturation = []
-    has_read_matrix = False
+        total_umi_reads = np.sum(umi_counts * umi_freqs)
+        if total_umi_reads == 0: return np.zeros(len(fractions))
+        
+        saturation = []
+        for f in fractions:
+            exp_reads = f * total_umi_reads
+            probs = 1.0 - np.power(1.0 - f, umi_counts)
+            exp_unique = np.sum(probs * umi_freqs)
+            sat = 1.0 - (exp_unique / exp_reads) if exp_reads > 0 else 0.0
+            saturation.append(sat)
+        return saturation
+
+    print(f"Calculating Library Saturation from {sat_json_global}...")
+    seq_sat_lib = calc_sat_curve(sat_json_global, fractions)
     
-    if read_matrix_dir:
-        print(f"Loading Read Matrix from {read_matrix_dir} for Gene Saturation...")
-        matrix_path = os.path.join(read_matrix_dir, "matrix.mtx.gz")
-        
-        # We only need the data column (counts) to calculate global detection probs
-        # But we want "Mean Genes Per Cell".
-        # Mean Genes = (Sum of Prob(Gene i in Cell j detected)) / Num_Cells
-        # We need Num_Cells.
-        
+    print(f"Calculating Gene Saturation from {sat_json_gene}...")
+    seq_sat_gene = calc_sat_curve(sat_json_gene, fractions)
+
+    # Helper to load matrix into per-cell counts
+    def load_per_cell_counts(matrix_dir):
+        if not matrix_dir: return None, 0
+        m_path = os.path.join(matrix_dir, "matrix.mtx.gz")
+        cell_data = collections.defaultdict(list)
+        num_cells = 0
         try:
-            opener = gzip.open if matrix_path.endswith('.gz') else open
-            read_counts = []
-            num_cells = 0
-            
-            # Read Matrix Dimensions first
-            with opener(matrix_path, 'rt') as f:
+            opener = gzip.open if m_path.endswith('.gz') else open
+            with opener(m_path, 'rt') as f:
                 header_passed = False
                 for line in f:
                     if line.startswith('%'): continue
@@ -268,61 +260,115 @@ def calculate_saturation(out_dir, project):
                         num_cells = int(parts[1])
                         header_passed = True
                         continue
-                    
-                    # Store count values
                     p = line.split()
+                    cell_idx = int(p[1])
                     val = int(p[2])
                     if val > 0:
-                        read_counts.append(val)
-            
-            read_counts_arr = np.array(read_counts, dtype=np.int64)
-            
-            if num_cells > 0 and len(read_counts_arr) > 0:
-                has_read_matrix = True
-                print("Calculating Gene Saturation...")
-                for f in fractions:
-                    # Prob(Gene detected) = 1 - (1-f)^reads
-                    # Sum of probs = Sum of Expected Genes across all cells
-                    probs = 1.0 - np.power(1.0 - f, read_counts_arr)
-                    total_exp_genes = np.sum(probs)
-                    mean_genes = total_exp_genes / num_cells
-                    gene_saturation.append(mean_genes)
-                    
+                        cell_data[cell_idx].append(val)
+            return cell_data, num_cells
         except Exception as e:
-            print(f"Error calculating gene saturation: {e}")
+            print(f"Error loading matrix {matrix_dir}: {e}")
+            return None, 0
+
+    # 2. Median Genes (UMI)
+    median_genes_umi = []
+    if umi_matrix_dir:
+        print(f"Loading UMI Matrix for Median Genes: {umi_matrix_dir}")
+        umi_cell_data, n_cells_u = load_per_cell_counts(umi_matrix_dir)
+        print(f"  - Loaded {len(umi_cell_data)} cells (Header says {n_cells_u})")
+        if umi_cell_data:
+            print("Calculating Median Genes (UMI)...")
+            # Optimize: Convert lists to numpy arrays once
+            cell_arrays = [np.array(counts, dtype=np.int64) for counts in umi_cell_data.values()]
+            
+            # Debug stats
+            total_counts = [c.sum() for c in cell_arrays]
+            print(f"  - UMI Counts per cell: Mean={np.mean(total_counts):.1f}, Median={np.median(total_counts):.1f}")
+            
+            for f in fractions:
+                # E[Genes] for each cell = Sum(1 - (1-f)^count)
+                cell_expectations = []
+                for counts in cell_arrays:
+                    probs = 1.0 - np.power(1.0 - f, counts)
+                    cell_expectations.append(np.sum(probs))
+                
+                if cell_expectations:
+                    median_genes_umi.append(np.median(cell_expectations))
+                else:
+                    median_genes_umi.append(0.0)
+
+    # 3. Median Genes (Read)
+    median_genes_read = []
+    if read_matrix_dir:
+        print(f"Loading Read Matrix for Median Genes: {read_matrix_dir}")
+        read_cell_data, n_cells_r = load_per_cell_counts(read_matrix_dir)
+        print(f"  - Loaded {len(read_cell_data)} cells (Header says {n_cells_r})")
+        if read_cell_data:
+            print("Calculating Median Genes (Read)...")
+            cell_arrays = [np.array(counts, dtype=np.int64) for counts in read_cell_data.values()]
+            
+            # Debug stats
+            total_counts = [c.sum() for c in cell_arrays]
+            print(f"  - Read Counts per cell: Mean={np.mean(total_counts):.1f}, Median={np.median(total_counts):.1f}")
+
+            for f in fractions:
+                cell_expectations = []
+                for counts in cell_arrays:
+                    probs = 1.0 - np.power(1.0 - f, counts)
+                    cell_expectations.append(np.sum(probs))
+                
+                if cell_expectations:
+                    median_genes_read.append(np.median(cell_expectations))
+                else:
+                    median_genes_read.append(0.0)
             
     return {
         "fractions": fractions,
-        "seq_saturation": seq_saturation,
-        "gene_saturation": gene_saturation if has_read_matrix else None
+        "seq_saturation_lib": seq_sat_lib,
+        "seq_saturation_gene": seq_sat_gene,
+        "median_genes_umi": median_genes_umi,
+        "median_genes_read": median_genes_read
     }
 
 def plot_saturation(stats, out_dir, project):
     if not HAS_MATPLOTLIB or not stats: return
     
     fractions = stats['fractions']
-    seq_sat = stats['seq_saturation']
-    gene_sat = stats['gene_saturation']
+    seq_sat_lib = stats['seq_saturation_lib']
+    seq_sat_gene = stats['seq_saturation_gene']
+    med_umi = stats.get('median_genes_umi')
+    med_read = stats.get('median_genes_read')
     
     fig, ax1 = plt.subplots(figsize=(8, 6))
     
-    # Plot Sequencing Saturation (Left Axis)
-    color = 'tab:red'
+    # Plot Sequencing Saturation
     ax1.set_xlabel('Sequencing Depth (Fraction)')
-    ax1.set_ylabel('Sequencing Saturation', color=color)
-    ax1.plot(fractions, seq_sat, marker='o', color=color, label='Seq Saturation')
-    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_ylabel('Sequencing Saturation', color='black')
+    
+    ax1.plot(fractions, seq_sat_lib, marker='o', color='tab:red', label='Sat (Library)')
+    ax1.plot(fractions, seq_sat_gene, marker='x', linestyle='--', color='tab:orange', label='Sat (Gene)')
+    
+    ax1.tick_params(axis='y', labelcolor='black')
     ax1.set_ylim(0, 1.05)
     ax1.grid(True, linestyle=':', alpha=0.6)
     
-    # Plot Gene Saturation (Right Axis)
-    if gene_sat:
-        ax2 = ax1.twinx()
-        color = 'tab:blue'
-        ax2.set_ylabel('Mean Genes per Cell', color=color)
-        ax2.plot(fractions, gene_sat, marker='s', color=color, label='Mean Genes')
-        ax2.tick_params(axis='y', labelcolor=color)
+    # Plot Median Genes
+    ax2 = ax1.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('Median Genes per Cell', color=color)
+    
+    if med_umi:
+        ax2.plot(fractions, med_umi, marker='s', linestyle='-', color=color, label='Median Genes (UMI)')
+    if med_read:
+        ax2.plot(fractions, med_read, marker='^', linestyle='--', color='tab:green', label='Median Genes (Read)')
         
+    ax2.tick_params(axis='y', labelcolor=color)
+    
+    # Combined Legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+    
     plt.title(f"Saturation Analysis: {project}")
     fig.tight_layout()
     
@@ -332,15 +378,16 @@ def plot_saturation(stats, out_dir, project):
     
     # Write TSV
     out_tsv = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.saturation.tsv")
+    print(f"Writing saturation table to {out_tsv}...")
     with open(out_tsv, 'w') as f:
-        header = "Fraction\tSeq_Saturation"
-        if gene_sat: header += "\tMean_Genes_Per_Cell"
-        f.write(header + "\n")
+        # Updated Header
+        f.write("Fraction\tSeq_Saturation_Library\tSeq_Saturation_Gene\tMedian_Genes_UMI\tMedian_Genes_Read\n")
         
         for i, frac in enumerate(fractions):
-            line = f"{frac:.1f}\t{seq_sat[i]:.4f}"
-            if gene_sat: line += f"\t{gene_sat[i]:.2f}"
-            f.write(line + "\n")
+            val_umi = med_umi[i] if med_umi and i < len(med_umi) else 0.0
+            val_read = med_read[i] if med_read and i < len(med_read) else 0.0
+            
+            f.write(f"{frac:.1f}\t{seq_sat_lib[i]:.4f}\t{seq_sat_gene[i]:.4f}\t{val_umi:.2f}\t{val_read:.2f}\n")
 
 def plot_features(read_stats, wells, out_pdf):
     if not HAS_MATPLOTLIB: return
@@ -439,6 +486,7 @@ def main():
     umi_exon_dir = os.path.join(out_dir, "zUMIs_output", "expression", f"{project}.exon.umi")
     umi_intron_dir = os.path.join(out_dir, "zUMIs_output", "expression", f"{project}.intron.umi")
     
+    # Load UMI stats
     stats_exon = calculate_matrix_stats(umi_exon_dir)
     stats_intron = calculate_matrix_stats(umi_intron_dir)
     
@@ -448,6 +496,19 @@ def main():
         in_st = stats_intron.get(bc, {'umis': 0, 'genes': 0, 'gene_set': set()})
         stats_inex[bc]['umis'] = ex_st['umis'] + in_st['umis']
         stats_inex[bc]['genes'] = len(ex_st['gene_set'] | in_st['gene_set'])
+
+    # Load Read stats (New Feature)
+    read_exon_dir = os.path.join(out_dir, "zUMIs_output", "expression", f"{project}.exon.read")
+    read_intron_dir = os.path.join(out_dir, "zUMIs_output", "expression", f"{project}.intron.read")
+    
+    rstats_exon = calculate_matrix_stats(read_exon_dir)
+    rstats_intron = calculate_matrix_stats(read_intron_dir)
+    
+    rstats_inex = collections.defaultdict(lambda: {'genes': 0})
+    for bc in set(rstats_exon.keys()) | set(rstats_intron.keys()):
+        ex_st = rstats_exon.get(bc, {'genes': 0, 'gene_set': set()})
+        in_st = rstats_intron.get(bc, {'genes': 0, 'gene_set': set()})
+        rstats_inex[bc]['genes'] = len(ex_st['gene_set'] | in_st['gene_set'])
 
     # 3. Load Pre-calculated Read Stats & Coverage
     stats_json_path = os.path.join(out_dir, "zUMIs_output", "stats", f"{project}.read_stats.json")
@@ -490,7 +551,8 @@ def main():
             "Ambiguity_reads", "Exon_reads", "Intergenic_reads", "intron_reads", 
             "Unmapped_reads", 
             "Exon_umis", "Intron_umis", "Intron_Exon_umis",
-            "Exon_genes", "Intron_genes", "Intron_Exon_genes"
+            "Exon_genes", "Intron_genes", "Intron_Exon_genes",
+            "Exon_read_genes", "Intron_read_genes", "Intron_Exon_read_genes"
         ]
         f.write("\t".join(headers) + "\n")
         
@@ -512,13 +574,18 @@ def main():
             in_st = stats_intron.get(well, {'umis': 0, 'genes': 0})
             inex_st = stats_inex.get(well, {'umis': 0, 'genes': 0})
             
+            rex_st = rstats_exon.get(well, {'genes': 0})
+            rin_st = rstats_intron.get(well, {'genes': 0})
+            rinex_st = rstats_inex.get(well, {'genes': 0})
+            
             row = [
                 well, int_bc, umi_bc,
                 internal_r, umi_r,
                 ambig, exon_r, inter_r, intron_r,
                 unmapped, 
                 ex_st['umis'], in_st['umis'], inex_st['umis'],
-                ex_st['genes'], in_st['genes'], inex_st['genes']
+                ex_st['genes'], in_st['genes'], inex_st['genes'],
+                rex_st['genes'], rin_st['genes'], rinex_st['genes']
             ]
             f.write("\t".join(map(str, row)) + "\n")
 
