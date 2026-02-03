@@ -393,10 +393,10 @@ def plot_features(read_stats, wells, out_pdf):
     if not HAS_MATPLOTLIB: return
     feat_colors = {
         "Exon": "#1A5084", "Intron": "#118730", "Unmapped": "#545454",
-        "Ambiguity": "#FFA54F", "MultiMapping": "#631879FF",
+        "Ambiguity": "#FFA54F", 
         "Intergenic": "#FFD700", "Unused BC": "#BABABA",
     }
-    categories_order = ["Exon", "Intron", "Intergenic", "Ambiguity", "MultiMapping", "Unmapped"]
+    categories_order = ["Exon", "Intron", "Intergenic", "Ambiguity", "Unmapped"]
     
     totals = {c: 0 for c in categories_order}
     per_cell_frac = {c: [] for c in categories_order}

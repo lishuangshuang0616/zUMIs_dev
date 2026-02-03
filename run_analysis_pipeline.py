@@ -56,7 +56,7 @@ def make_dir(data):
     print(f"Directory 'outs' created/verified at: {outs_path}")
     
     # Create zUMIs output dirs inside XPRESS_PROCESSING
-    for dirs in ['zUMIs_output', 'zUMIs_output/expression/downsampling', 'zUMIs_output/stats', 'zUMIs_output/.tmpMerge']:
+    for dirs in ['zUMIs_output', 'zUMIs_output/stats', 'zUMIs_output/.tmpMerge']:
         os.makedirs(f'{out_path}/{dirs}', exist_ok=True)
 
 def create_barcode(data):
@@ -665,6 +665,17 @@ def main():
     run_pipeline_stages(final_yaml_path)
 
     print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} All analysis finished.', flush=True)
+
+    # Generate HTML Report
+    try:
+        from pathlib import Path
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent / 'src'))
+        import report as report
+        print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} Generating HTML Report...', flush=True)
+        report.generate_multi_report(config['project'], config['out_dir'], config)
+    except Exception as e:
+        print(f"Error generating HTML report: {e}", file=sys.stderr)
 
 if __name__ == '__main__':
     main()
